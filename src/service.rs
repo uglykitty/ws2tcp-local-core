@@ -2,6 +2,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use anyhow::{Result, anyhow};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::{
@@ -13,6 +14,15 @@ use crate::{
 };
 
 pub async fn run_proxy(settings: Settings, shutdown: impl Future<Output = ()>) -> Result<()> {
+    let (_mode_updates_tx, mode_updates_rx) = mpsc::unbounded_channel();
+    run_proxy_with_mode_updates(settings, shutdown, mode_updates_rx).await
+}
+
+pub async fn run_proxy_with_mode_updates(
+    settings: Settings,
+    shutdown: impl Future<Output = ()>,
+    mut mode_updates: mpsc::UnboundedReceiver<crate::ProxyMode>,
+) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let routing_rules = RoutingRules::load(
@@ -28,6 +38,12 @@ pub async fn run_proxy(settings: Settings, shutdown: impl Future<Output = ()>) -
         buffer_size: settings.buffer_size,
         routing_rules,
         verify_server_certificate: settings.verify_server_certificate,
+    });
+    let dynamic_routing_rules = config.routing_rules.clone();
+    tokio::spawn(async move {
+        while let Some(mode) = mode_updates.recv().await {
+            dynamic_routing_rules.set_mode(mode);
+        }
     });
     let listener = TcpListener::bind(settings.listen)
         .await

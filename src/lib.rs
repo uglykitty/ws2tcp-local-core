@@ -9,7 +9,7 @@ pub mod settings;
 mod tls;
 mod tunnel;
 
-pub use service::run_proxy;
+pub use service::{run_proxy, run_proxy_with_mode_updates};
 pub use settings::{
     DEFAULT_BUFFER_SIZE, DEFAULT_LISTEN, DEFAULT_RULE_REFRESH_INTERVAL_SECS, ProxyMode, Settings,
     SettingsOverrides,

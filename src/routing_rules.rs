@@ -2,7 +2,10 @@ use std::{
     collections::HashSet,
     fs::{self, FileTimes},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -23,6 +26,9 @@ const GFWLIST_CACHE_FILE: &str = "gfwlist.txt";
 #[derive(Debug, Clone)]
 pub(crate) struct RoutingRules {
     state: Arc<RwLock<RoutingRulesState>>,
+    generation: Arc<AtomicU64>,
+    custom_domain_rules: Option<PathBuf>,
+    refresh_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -43,7 +49,11 @@ impl RoutingRules {
     ) -> Self {
         if proxy_mode == ProxyMode::Global {
             info!("using global proxy mode; skipping proxy routing rule download");
-            return Self::new(RoutingRulesState::GlobalProxy);
+            return Self::new(
+                RoutingRulesState::GlobalProxy,
+                custom_domain_rules.map(Path::to_path_buf),
+                refresh_interval,
+            );
         }
 
         let mut loader = AutoRuleLoader::new(custom_domain_rules.map(Path::to_path_buf));
@@ -59,26 +69,49 @@ impl RoutingRules {
                 RoutingRulesState::DirectFallback
             }
         };
-        let rules = Self::new(state);
-        rules.spawn_auto_refresh(loader, refresh_interval);
+        let rules = Self::new(
+            state,
+            custom_domain_rules.map(Path::to_path_buf),
+            refresh_interval,
+        );
+        rules.spawn_auto_refresh(loader, refresh_interval, 0);
         rules
     }
 
-    fn new(state: RoutingRulesState) -> Self {
+    fn new(
+        state: RoutingRulesState,
+        custom_domain_rules: Option<PathBuf>,
+        refresh_interval: Duration,
+    ) -> Self {
         Self {
             state: Arc::new(RwLock::new(state)),
+            generation: Arc::new(AtomicU64::new(0)),
+            custom_domain_rules,
+            refresh_interval,
         }
     }
 
-    fn spawn_auto_refresh(&self, mut loader: AutoRuleLoader, refresh_interval: Duration) {
+    fn spawn_auto_refresh(
+        &self,
+        mut loader: AutoRuleLoader,
+        refresh_interval: Duration,
+        generation: u64,
+    ) {
         let state = Arc::clone(&self.state);
+        let current_generation = Arc::clone(&self.generation);
 
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(refresh_interval).await;
+                if current_generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
 
                 match loader.load_state().await {
                     Ok(next_state) => {
+                        if current_generation.load(Ordering::Acquire) != generation {
+                            return;
+                        }
                         let mut guard = state.write().expect("routing rules lock poisoned");
                         *guard = next_state;
                     }
@@ -94,6 +127,41 @@ impl RoutingRules {
                 }
             }
         });
+    }
+
+    pub(crate) fn set_mode(&self, mode: ProxyMode) {
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        match mode {
+            ProxyMode::Global => {
+                *self.state.write().expect("routing rules lock poisoned") =
+                    RoutingRulesState::GlobalProxy;
+                info!("proxy mode dynamically changed to global");
+            }
+            ProxyMode::Auto => {
+                let rules = self.clone();
+                tokio::spawn(async move {
+                    let mut loader = AutoRuleLoader::new(rules.custom_domain_rules.clone());
+                    match loader.load_state().await {
+                        Ok(next_state) => {
+                            if rules.generation.load(Ordering::Acquire) != generation {
+                                return;
+                            }
+                            *rules.state.write().expect("routing rules lock poisoned") = next_state;
+                            info!("proxy mode dynamically changed to auto");
+                            rules.spawn_auto_refresh(loader, rules.refresh_interval, generation);
+                        }
+                        Err(err) => {
+                            if rules.generation.load(Ordering::Acquire) != generation {
+                                return;
+                            }
+                            *rules.state.write().expect("routing rules lock poisoned") =
+                                RoutingRulesState::DirectFallback;
+                            warn!(error = %format_args!("{err:#}"), "failed to switch proxy mode to auto; using direct routing")
+                        }
+                    }
+                });
+            }
+        }
     }
 
     pub(crate) fn should_proxy_host(&self, host: &str) -> bool {
@@ -676,7 +744,11 @@ bad:domain
 
     #[test]
     fn global_proxy_matches_every_host() {
-        let rules = RoutingRules::new(RoutingRulesState::GlobalProxy);
+        let rules = RoutingRules::new(
+            RoutingRulesState::GlobalProxy,
+            None,
+            Duration::from_secs(60),
+        );
 
         assert!(rules.should_proxy_host("example.com"));
         assert_eq!(rules.to_string(), "global");
@@ -701,7 +773,11 @@ bad:domain
 
     #[test]
     fn auto_fallback_routes_direct_by_default() {
-        let rules = RoutingRules::new(RoutingRulesState::DirectFallback);
+        let rules = RoutingRules::new(
+            RoutingRulesState::DirectFallback,
+            None,
+            Duration::from_secs(60),
+        );
 
         assert!(!rules.should_proxy_host("example.com"));
         assert_eq!(rules.to_string(), "auto");
@@ -709,6 +785,20 @@ bad:domain
             rules.describe(),
             format!("direct routing; failed to load {GFWLIST_URL}")
         );
+    }
+
+    #[test]
+    fn dynamically_switches_to_global_mode() {
+        let rules = RoutingRules::new(
+            RoutingRulesState::DirectFallback,
+            None,
+            Duration::from_secs(60),
+        );
+
+        rules.set_mode(ProxyMode::Global);
+
+        assert!(rules.should_proxy_host("example.com"));
+        assert_eq!(rules.to_string(), "global");
     }
 
     fn temp_custom_rules_path(name: &str) -> PathBuf {
