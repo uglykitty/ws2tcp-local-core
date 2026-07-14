@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.2 - 2026-07-14
+
+### Changed
+
+- Check the platform gfwlist cache for read and write access when automatic
+  routing rules start loading.
+- Fall back to an in-memory gfwlist cache when the disk cache is unavailable at
+  startup or fails during a later read or write.
+- Keep the downloaded rules usable when disk cache access fails instead of
+  falling back to direct routing.
+
 ## 0.1.5 - 2026-07-08
 
 ### Changed

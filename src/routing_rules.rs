@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
-    fs::{self, FileTimes},
+    fs::{self, FileTimes, OpenOptions},
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
@@ -190,6 +191,7 @@ impl RoutingRules {
 struct AutoRuleLoader {
     custom_domain_rules: Option<PathBuf>,
     custom_cache: Option<CustomDomainRulesCache>,
+    gfwlist_cache: GfwlistCache,
 }
 
 #[derive(Debug, Clone)]
@@ -198,11 +200,21 @@ struct CustomDomainRulesCache {
     domains: HashSet<String>,
 }
 
+#[derive(Debug)]
+enum GfwlistCache {
+    Disk(PathBuf),
+    Memory {
+        body: Option<Vec<u8>>,
+        modified: Option<SystemTime>,
+    },
+}
+
 impl AutoRuleLoader {
     fn new(custom_domain_rules: Option<PathBuf>) -> Self {
         Self {
             custom_domain_rules,
             custom_cache: None,
+            gfwlist_cache: GfwlistCache::new(),
         }
     }
 
@@ -215,7 +227,7 @@ impl AutoRuleLoader {
     }
 
     async fn download_and_parse(&mut self) -> Result<DomainRules> {
-        let body = load_gfwlist_body().await?;
+        let body = self.gfwlist_cache.load_gfwlist_body().await?;
 
         let mut rules = parse_gfwlist(&body)?;
         if let Some(custom_domains) = self.load_custom_domain_rules()? {
@@ -320,38 +332,115 @@ impl RoutingRulesState {
     }
 }
 
-async fn load_gfwlist_body() -> Result<Vec<u8>> {
-    let cache_path = gfwlist_cache_path()?;
-    let client = Client::new();
-    let remote_modified = fetch_remote_last_modified(&client).await?;
-
-    if let Some(remote_modified) = remote_modified
-        && is_cache_current(&cache_path, remote_modified)?
-    {
-        info!(
-            cache_path = %cache_path.display(),
-            url = GFWLIST_URL,
-            "using cached gfwlist"
-        );
-        return fs::read(&cache_path)
-            .with_context(|| format!("failed to read cached gfwlist {}", cache_path.display()));
+impl GfwlistCache {
+    fn new() -> Self {
+        match gfwlist_cache_path().and_then(check_gfwlist_cache_access) {
+            Ok(path) => Self::Disk(path),
+            Err(err) => {
+                warn!(
+                    error = %format_args!("{err:#}"),
+                    "gfwlist disk cache is unavailable; using in-memory cache"
+                );
+                Self::empty_memory()
+            }
+        }
     }
 
-    let response = client
-        .get(GFWLIST_URL)
-        .send()
-        .await
-        .with_context(|| format!("failed to download {GFWLIST_URL}"))?
-        .error_for_status()
-        .with_context(|| format!("failed to download {GFWLIST_URL}"))?;
-    let downloaded_modified = parse_last_modified(response.headers()).or(remote_modified);
-    let body = response
-        .bytes()
-        .await
-        .context("failed to read gfwlist response body")?;
-    write_gfwlist_cache(&cache_path, &body, downloaded_modified)?;
+    fn empty_memory() -> Self {
+        Self::Memory {
+            body: None,
+            modified: None,
+        }
+    }
 
-    Ok(body.to_vec())
+    fn switch_to_memory(&mut self, error: &anyhow::Error) {
+        warn!(
+            error = %format_args!("{error:#}"),
+            "gfwlist disk cache failed; switching to in-memory cache"
+        );
+        *self = Self::empty_memory();
+    }
+
+    fn memory_body_if_current(&self, remote_modified: Option<SystemTime>) -> Option<Vec<u8>> {
+        let Self::Memory { body, modified } = self else {
+            return None;
+        };
+        let remote_modified = remote_modified?;
+        let cached_modified = (*modified)?;
+
+        system_times_match_to_second(cached_modified, remote_modified)
+            .then(|| body.clone())
+            .flatten()
+    }
+
+    fn store_in_memory(&mut self, body: Vec<u8>, modified: Option<SystemTime>) {
+        *self = Self::Memory {
+            body: Some(body),
+            modified,
+        };
+    }
+
+    async fn load_gfwlist_body(&mut self) -> Result<Vec<u8>> {
+        let client = Client::new();
+        let remote_modified = fetch_remote_last_modified(&client).await?;
+
+        if let Self::Disk(cache_path) = self {
+            let cached = match remote_modified {
+                Some(remote_modified) => match is_cache_current(cache_path, remote_modified) {
+                    Ok(true) => Some(fs::read(&*cache_path).with_context(|| {
+                        format!("failed to read cached gfwlist {}", cache_path.display())
+                    })),
+                    Ok(false) => None,
+                    Err(err) => Some(Err(err)),
+                },
+                None => None,
+            };
+
+            if let Some(cached) = cached {
+                match cached {
+                    Ok(body) => {
+                        info!(
+                            cache_path = %cache_path.display(),
+                            url = GFWLIST_URL,
+                            "using cached gfwlist"
+                        );
+                        return Ok(body);
+                    }
+                    Err(err) => self.switch_to_memory(&err),
+                }
+            }
+        }
+
+        if let Some(body) = self.memory_body_if_current(remote_modified) {
+            info!(url = GFWLIST_URL, "using in-memory cached gfwlist");
+            return Ok(body);
+        }
+
+        let response = client
+            .get(GFWLIST_URL)
+            .send()
+            .await
+            .with_context(|| format!("failed to download {GFWLIST_URL}"))?
+            .error_for_status()
+            .with_context(|| format!("failed to download {GFWLIST_URL}"))?;
+        let downloaded_modified = parse_last_modified(response.headers()).or(remote_modified);
+        let body = response
+            .bytes()
+            .await
+            .context("failed to read gfwlist response body")?
+            .to_vec();
+
+        if let Self::Disk(cache_path) = self
+            && let Err(err) = write_gfwlist_cache(cache_path, &body, downloaded_modified)
+        {
+            self.switch_to_memory(&err);
+        }
+        if matches!(self, Self::Memory { .. }) {
+            self.store_in_memory(body.clone(), downloaded_modified);
+        }
+
+        Ok(body)
+    }
 }
 
 async fn fetch_remote_last_modified(client: &Client) -> Result<Option<SystemTime>> {
@@ -377,6 +466,64 @@ fn gfwlist_cache_path() -> Result<PathBuf> {
     let cache_dir = user_cache_dir()?;
 
     Ok(cache_dir.join(CACHE_DIR_NAME).join(GFWLIST_CACHE_FILE))
+}
+
+fn check_gfwlist_cache_access(cache_path: PathBuf) -> Result<PathBuf> {
+    let parent = cache_path
+        .parent()
+        .context("gfwlist cache path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create gfwlist cache directory {}",
+            parent.display()
+        )
+    })?;
+
+    if cache_path.exists() {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&cache_path)
+            .with_context(|| {
+                format!(
+                    "gfwlist cache is not readable and writable {}",
+                    cache_path.display()
+                )
+            })?;
+    }
+
+    let probe_path = parent.join(format!(".cache-access-{}", std::process::id()));
+    let probe_result = (|| -> Result<()> {
+        let mut probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+            .with_context(|| {
+                format!(
+                    "gfwlist cache directory is not writable {}",
+                    parent.display()
+                )
+            })?;
+        probe.write_all(b"ok")?;
+        probe.rewind()?;
+        let mut contents = String::new();
+        probe.read_to_string(&mut contents)?;
+        if contents != "ok" {
+            bail!("gfwlist cache access probe returned unexpected contents");
+        }
+        Ok(())
+    })();
+    let remove_result = fs::remove_file(&probe_path);
+    probe_result?;
+    remove_result.with_context(|| {
+        format!(
+            "failed to remove gfwlist cache access probe {}",
+            probe_path.display()
+        )
+    })?;
+
+    Ok(cache_path)
 }
 
 #[cfg(windows)]
