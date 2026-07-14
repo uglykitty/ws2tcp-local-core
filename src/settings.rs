@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 pub const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
-pub const DEFAULT_LISTEN: &str = "127.0.0.1:8000";
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:3128";
 pub const DEFAULT_RULE_REFRESH_INTERVAL_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -108,7 +108,7 @@ impl Settings {
             proxy_mode: overrides
                 .proxy_mode
                 .or(file_settings.proxy_mode)
-                .unwrap_or(ProxyMode::Global),
+                .unwrap_or(ProxyMode::Auto),
             verify_server_certificate: if overrides.verify_server_certificate {
                 true
             } else {
@@ -301,7 +301,7 @@ verify_server_certificate = true
     }
 
     #[test]
-    fn uses_global_proxy_mode_by_default() {
+    fn uses_auto_proxy_mode_by_default() {
         let settings = Settings::resolve(SettingsOverrides {
             config: None,
             listen: None,
@@ -316,7 +316,26 @@ verify_server_certificate = true
         })
         .unwrap();
 
-        assert_eq!(settings.proxy_mode, ProxyMode::Global);
+        assert_eq!(settings.proxy_mode, ProxyMode::Auto);
+    }
+
+    #[test]
+    fn uses_default_listen_address() {
+        let settings = Settings::resolve(SettingsOverrides {
+            config: None,
+            listen: None,
+            gateway: Some("wss://example.com/ws".to_owned()),
+            basic_auth: None,
+            buffer_size: None,
+            log_level: None,
+            custom_domain_rules: None,
+            rule_refresh_interval_secs: None,
+            proxy_mode: None,
+            verify_server_certificate: false,
+        })
+        .unwrap();
+
+        assert_eq!(settings.listen, "127.0.0.1:3128".parse().unwrap());
     }
 
     #[test]
