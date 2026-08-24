@@ -37,7 +37,7 @@ pub async fn run_proxy_with_mode_updates(
         basic_auth: remote_basic_auth(settings.basic_auth)?,
         buffer_size: settings.buffer_size,
         routing_rules,
-        verify_server_certificate: settings.verify_server_certificate,
+        insecure: settings.insecure,
     });
     let dynamic_routing_rules = config.routing_rules.clone();
     tokio::spawn(async move {
@@ -53,15 +53,15 @@ pub async fn run_proxy_with_mode_updates(
     info!(
         listen = %listen_addr,
         gateway = %config.gateway.base(),
-        verify_server_certificate = config.verify_server_certificate,
+        insecure = config.insecure,
         rule_refresh_interval_secs = settings.rule_refresh_interval.as_secs(),
         routing_rules = %config.routing_rules,
         routing_rules_detail = %config.routing_rules.describe(),
         "listening"
     );
-    if !config.verify_server_certificate {
+    if config.insecure {
         warn!(
-            "remote gateway TLS server certificate verification is disabled; use --verify-server-certificate or verify_server_certificate = true to enable it"
+            "remote gateway TLS server certificate verification is disabled because insecure mode is enabled"
         );
     }
 

@@ -29,7 +29,7 @@ pub struct Settings {
     pub custom_domain_rules: Option<PathBuf>,
     pub rule_refresh_interval: Duration,
     pub proxy_mode: ProxyMode,
-    pub verify_server_certificate: bool,
+    pub insecure: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -42,7 +42,7 @@ struct FileSettings {
     custom_domain_rules: Option<PathBuf>,
     rule_refresh_interval_secs: Option<u64>,
     proxy_mode: Option<ProxyMode>,
-    verify_server_certificate: Option<bool>,
+    insecure: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -56,7 +56,7 @@ pub struct SettingsOverrides {
     pub custom_domain_rules: Option<PathBuf>,
     pub rule_refresh_interval_secs: Option<u64>,
     pub proxy_mode: Option<ProxyMode>,
-    pub verify_server_certificate: bool,
+    pub insecure: bool,
 }
 
 impl Settings {
@@ -109,10 +109,10 @@ impl Settings {
                 .proxy_mode
                 .or(file_settings.proxy_mode)
                 .unwrap_or(ProxyMode::Auto),
-            verify_server_certificate: if overrides.verify_server_certificate {
+            insecure: if overrides.insecure {
                 true
             } else {
-                file_settings.verify_server_certificate.unwrap_or(false)
+                file_settings.insecure.unwrap_or(false)
             },
         })
     }
@@ -151,7 +151,7 @@ mod tests {
             custom_domain_rules: None,
             rule_refresh_interval_secs: None,
             proxy_mode: None,
-            verify_server_certificate: false,
+            insecure: false,
         }
     }
 
@@ -172,7 +172,7 @@ mod tests {
             custom_domain_rules: Some("cli-domains.txt".into()),
             rule_refresh_interval_secs: Some(30),
             proxy_mode: Some(ProxyMode::Global),
-            verify_server_certificate: true,
+            insecure: true,
         })
         .unwrap();
 
@@ -187,7 +187,7 @@ mod tests {
         );
         assert_eq!(settings.rule_refresh_interval, Duration::from_secs(30));
         assert_eq!(settings.proxy_mode, ProxyMode::Global);
-        assert!(settings.verify_server_certificate);
+        assert!(settings.insecure);
     }
 
     #[test]
@@ -208,7 +208,7 @@ log_level = "info"
 custom_domain_rules = "file-domains.txt"
 rule_refresh_interval_secs = 45
 proxy_mode = "auto"
-verify_server_certificate = true
+insecure = true
 "#,
         )
         .unwrap();
@@ -223,7 +223,7 @@ verify_server_certificate = true
             custom_domain_rules: Some("cli-domains.txt".into()),
             rule_refresh_interval_secs: Some(30),
             proxy_mode: Some(ProxyMode::Global),
-            verify_server_certificate: false,
+            insecure: false,
         })
         .unwrap();
         let _ = fs::remove_file(&config_path);
@@ -239,7 +239,7 @@ verify_server_certificate = true
         );
         assert_eq!(settings.rule_refresh_interval, Duration::from_secs(30));
         assert_eq!(settings.proxy_mode, ProxyMode::Global);
-        assert!(settings.verify_server_certificate);
+        assert!(settings.insecure);
     }
 
     #[test]
@@ -259,7 +259,7 @@ log_level = "info"
 custom_domain_rules = "custom-domains.txt"
 rule_refresh_interval_secs = 45
 proxy_mode = "global"
-verify_server_certificate = true
+insecure = true
 "#,
         )
         .unwrap();
@@ -278,11 +278,11 @@ verify_server_certificate = true
         );
         assert_eq!(settings.rule_refresh_interval, Duration::from_secs(45));
         assert_eq!(settings.proxy_mode, ProxyMode::Global);
-        assert!(settings.verify_server_certificate);
+        assert!(settings.insecure);
     }
 
     #[test]
-    fn disables_server_certificate_verification_by_default() {
+    fn verifies_server_certificate_by_default() {
         let settings = Settings::resolve(SettingsOverrides {
             config: None,
             listen: None,
@@ -293,11 +293,11 @@ verify_server_certificate = true
             custom_domain_rules: None,
             rule_refresh_interval_secs: None,
             proxy_mode: None,
-            verify_server_certificate: false,
+            insecure: false,
         })
         .unwrap();
 
-        assert!(!settings.verify_server_certificate);
+        assert!(!settings.insecure);
     }
 
     #[test]
@@ -312,7 +312,7 @@ verify_server_certificate = true
             custom_domain_rules: None,
             rule_refresh_interval_secs: None,
             proxy_mode: None,
-            verify_server_certificate: false,
+            insecure: false,
         })
         .unwrap();
 
@@ -331,7 +331,7 @@ verify_server_certificate = true
             custom_domain_rules: None,
             rule_refresh_interval_secs: None,
             proxy_mode: None,
-            verify_server_certificate: false,
+            insecure: false,
         })
         .unwrap();
 
@@ -350,7 +350,7 @@ verify_server_certificate = true
             custom_domain_rules: None,
             rule_refresh_interval_secs: None,
             proxy_mode: None,
-            verify_server_certificate: false,
+            insecure: false,
         })
         .unwrap();
 
@@ -373,7 +373,7 @@ verify_server_certificate = true
                 custom_domain_rules: None,
                 rule_refresh_interval_secs: Some(0),
                 proxy_mode: None,
-                verify_server_certificate: false,
+                insecure: false,
             })
             .is_err()
         );

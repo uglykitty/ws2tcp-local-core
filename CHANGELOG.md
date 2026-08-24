@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3 - 2026-08-24
+
+### Changed
+
+- Replaced `verify_server_certificate` with the curl-style `insecure` setting.
+- Enabled TLS server certificate verification by default and use the insecure
+  connector only when explicitly requested.
+
 ## 0.1.2 - 2026-07-14
 
 ### Changed

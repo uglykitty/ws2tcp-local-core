@@ -23,7 +23,7 @@ pub(crate) struct Config {
     pub(crate) basic_auth: Option<String>,
     pub(crate) buffer_size: usize,
     pub(crate) routing_rules: RoutingRules,
-    pub(crate) verify_server_certificate: bool,
+    pub(crate) insecure: bool,
 }
 
 pub(crate) async fn handle_client(
@@ -72,10 +72,10 @@ async fn handle_gateway(
         );
     }
 
-    let connector = if config.verify_server_certificate {
-        None
-    } else {
+    let connector = if config.insecure {
         Some(insecure_websocket_connector())
+    } else {
+        None
     };
     let (websocket, _) =
         match connect_async_tls_with_config(ws_request, None, false, connector).await {
