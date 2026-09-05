@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.4 - 2026-09-05
+
+### Changed
+
+- Download gfwlist from the primary mirror
+  `https://wangguofang.net/raw.githubusercontent.com/gfwlist/gfwlist/refs/heads/master/gfwlist.txt`
+  first, falling back to `https://gitlab.com/gfwlist/gfwlist/raw/master/gfwlist.txt`
+  when the primary URL is unreachable.
+
 ## 0.1.3 - 2026-08-24
 
 ### Changed
