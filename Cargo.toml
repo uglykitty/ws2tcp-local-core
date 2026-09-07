@@ -1,6 +1,6 @@
 [package]
 name = "ws2tcp-local-core"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Core proxy library for ws2tcp-local."
 license = "MIT"
@@ -33,5 +33,4 @@ tokio = { version = "1.45", features = ["rt", "macros", "net", "io-util", "sync"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"

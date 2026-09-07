@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.5 - 2026-09-07
+
+### Removed
+
+- Removed `init_logging` and the `tracing-subscriber` dependency. This crate
+  is embedded by multiple frontends (CLI, FFI, GUI) that each need their own
+  logging setup (stdout, systemd journal, an FFI callback, ...), so installing
+  a global `tracing` subscriber does not belong in a shared library. Callers
+  should initialize their own subscriber before invoking `run_proxy`.
+
 ## 0.1.4 - 2026-09-05
 
 ### Changed
