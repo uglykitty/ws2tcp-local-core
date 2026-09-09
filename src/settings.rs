@@ -22,6 +22,7 @@ pub enum ProxyMode {
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub listen: SocketAddr,
+    pub socks_listen: Option<SocketAddr>,
     pub gateway: String,
     pub basic_auth: Option<String>,
     pub buffer_size: usize,
@@ -35,6 +36,7 @@ pub struct Settings {
 #[derive(Debug, Default, Deserialize)]
 struct FileSettings {
     listen: Option<SocketAddr>,
+    socks_listen: Option<SocketAddr>,
     gateway: Option<String>,
     basic_auth: Option<String>,
     buffer_size: Option<usize>,
@@ -49,6 +51,7 @@ struct FileSettings {
 pub struct SettingsOverrides {
     pub config: Option<PathBuf>,
     pub listen: Option<SocketAddr>,
+    pub socks_listen: Option<SocketAddr>,
     pub gateway: Option<String>,
     pub basic_auth: Option<String>,
     pub buffer_size: Option<usize>,
@@ -95,6 +98,7 @@ impl Settings {
 
         Ok(Self {
             listen,
+            socks_listen: overrides.socks_listen.or(file_settings.socks_listen),
             gateway,
             basic_auth: overrides.basic_auth.or(file_settings.basic_auth),
             buffer_size,
@@ -144,6 +148,7 @@ mod tests {
         SettingsOverrides {
             config,
             listen: None,
+            socks_listen: None,
             gateway: None,
             basic_auth: None,
             buffer_size: None,
@@ -165,6 +170,7 @@ mod tests {
         let settings = Settings::resolve(SettingsOverrides {
             config: None,
             listen: Some("127.0.0.1:9000".parse().unwrap()),
+            socks_listen: None,
             gateway: Some("wss://example.com/ws".to_owned()),
             basic_auth: Some("user:pass".to_owned()),
             buffer_size: Some(4096),
@@ -216,6 +222,7 @@ insecure = true
         let settings = Settings::resolve(SettingsOverrides {
             config: Some(config_path.clone()),
             listen: Some("127.0.0.1:9000".parse().unwrap()),
+            socks_listen: None,
             gateway: Some("wss://cli.example/ws".to_owned()),
             basic_auth: Some("cli:secret".to_owned()),
             buffer_size: Some(2048),
@@ -286,6 +293,7 @@ insecure = true
         let settings = Settings::resolve(SettingsOverrides {
             config: None,
             listen: None,
+            socks_listen: None,
             gateway: Some("wss://example.com/ws".to_owned()),
             basic_auth: None,
             buffer_size: None,
@@ -305,6 +313,7 @@ insecure = true
         let settings = Settings::resolve(SettingsOverrides {
             config: None,
             listen: None,
+            socks_listen: None,
             gateway: Some("wss://example.com/ws".to_owned()),
             basic_auth: None,
             buffer_size: None,
@@ -324,6 +333,7 @@ insecure = true
         let settings = Settings::resolve(SettingsOverrides {
             config: None,
             listen: None,
+            socks_listen: None,
             gateway: Some("wss://example.com/ws".to_owned()),
             basic_auth: None,
             buffer_size: None,
@@ -343,6 +353,7 @@ insecure = true
         let settings = Settings::resolve(SettingsOverrides {
             config: None,
             listen: None,
+            socks_listen: None,
             gateway: Some("wss://example.com/ws".to_owned()),
             basic_auth: None,
             buffer_size: None,
@@ -366,6 +377,7 @@ insecure = true
             Settings::resolve(SettingsOverrides {
                 config: None,
                 listen: None,
+                socks_listen: None,
                 gateway: Some("wss://example.com/ws".to_owned()),
                 basic_auth: None,
                 buffer_size: None,

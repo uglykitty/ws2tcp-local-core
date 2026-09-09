@@ -14,6 +14,7 @@ use crate::{
     gateway::Gateway,
     http_proxy::read_proxy_request,
     routing_rules::{RoutingRules, host_from_authority},
+    socks5::{self, read_socks5_request},
     tls::insecure_websocket_connector,
 };
 
@@ -24,6 +25,43 @@ pub(crate) struct Config {
     pub(crate) buffer_size: usize,
     pub(crate) routing_rules: RoutingRules,
     pub(crate) insecure: bool,
+}
+
+/// How to acknowledge a tunneled connection to the client, which differs by the
+/// listening protocol: HTTP CONNECT and SOCKS5 both need an explicit reply before
+/// bytes start flowing, while an ordinary HTTP proxy request has no such reply of
+/// its own (the origin server's response passes straight through the tunnel).
+enum ReplyStyle {
+    HttpConnect,
+    HttpPlain,
+    Socks5,
+}
+
+impl ReplyStyle {
+    async fn write_success(&self, client: &mut TcpStream) -> Result<()> {
+        match self {
+            Self::HttpConnect => client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .context("write CONNECT success response failed"),
+            Self::HttpPlain => Ok(()),
+            Self::Socks5 => client
+                .write_all(&socks5::SUCCESS_REPLY)
+                .await
+                .context("write SOCKS5 success reply failed"),
+        }
+    }
+
+    async fn write_error(&self, client: &mut TcpStream) {
+        match self {
+            Self::HttpConnect | Self::HttpPlain => {
+                let _ = write_http_error(client, "502 Bad Gateway").await;
+            }
+            Self::Socks5 => {
+                let _ = client.write_all(&socks5::GENERAL_FAILURE_REPLY).await;
+            }
+        }
+    }
 }
 
 pub(crate) async fn handle_client(
@@ -41,23 +79,89 @@ pub(crate) async fn handle_client(
     let authority = request.authority().to_owned();
     let host = host_from_authority(&authority)?;
     let should_proxy = config.routing_rules.should_proxy_host(host);
+    let log_kind = request.log_kind();
+    let reply = if request.is_connect() {
+        ReplyStyle::HttpConnect
+    } else {
+        ReplyStyle::HttpPlain
+    };
+    let initial_client_bytes = request.initial_client_bytes();
 
     if !should_proxy {
-        return handle_direct(client, peer_addr, request).await;
+        return handle_direct(
+            client,
+            peer_addr,
+            authority,
+            initial_client_bytes,
+            log_kind,
+            reply,
+        )
+        .await;
     }
 
-    handle_gateway(client, peer_addr, request, config).await
+    handle_gateway(
+        client,
+        peer_addr,
+        authority,
+        initial_client_bytes,
+        log_kind,
+        reply,
+        config,
+    )
+    .await
+}
+
+pub(crate) async fn handle_socks_client(
+    mut client: TcpStream,
+    peer_addr: SocketAddr,
+    config: Arc<Config>,
+) -> Result<()> {
+    let request = match read_socks5_request(&mut client).await {
+        Ok(request) => request,
+        Err(err) => {
+            let _ = client.write_all(&socks5::GENERAL_FAILURE_REPLY).await;
+            return Err(err);
+        }
+    };
+    let host = host_from_authority(&request.authority)?;
+    let should_proxy = config.routing_rules.should_proxy_host(host);
+
+    if !should_proxy {
+        return handle_direct(
+            client,
+            peer_addr,
+            request.authority,
+            Vec::new(),
+            "socks5",
+            ReplyStyle::Socks5,
+        )
+        .await;
+    }
+
+    handle_gateway(
+        client,
+        peer_addr,
+        request.authority,
+        Vec::new(),
+        "socks5",
+        ReplyStyle::Socks5,
+        config,
+    )
+    .await
 }
 
 async fn handle_gateway(
     mut client: TcpStream,
     peer_addr: SocketAddr,
-    request: crate::http_proxy::ProxyRequest,
+    authority: String,
+    initial_client_bytes: Vec<u8>,
+    log_kind: &'static str,
+    reply: ReplyStyle,
     config: Arc<Config>,
 ) -> Result<()> {
-    let ws_url = config.gateway.target_url(request.authority());
+    let ws_url = config.gateway.target_url(&authority);
 
-    info!(%peer_addr, target = %request.authority(), gateway = %ws_url, kind = request.log_kind(), "proxying request");
+    info!(%peer_addr, target = %authority, gateway = %ws_url, kind = log_kind, "proxying request");
 
     let mut ws_request = ws_url
         .as_str()
@@ -81,20 +185,12 @@ async fn handle_gateway(
         match connect_async_tls_with_config(ws_request, None, false, connector).await {
             Ok(parts) => parts,
             Err(err) => {
-                let _ = write_http_error(&mut client, "502 Bad Gateway").await;
+                reply.write_error(&mut client).await;
                 return Err(err).with_context(|| format!("failed to connect gateway {ws_url}"));
             }
         };
 
-    let is_connect = request.is_connect();
-    let initial_client_bytes = request.initial_client_bytes();
-
-    if is_connect {
-        client
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await
-            .context("write CONNECT success response failed")?;
-    }
+    reply.write_success(&mut client).await?;
 
     proxy(client, websocket, initial_client_bytes, config.buffer_size).await
 }
@@ -102,29 +198,22 @@ async fn handle_gateway(
 async fn handle_direct(
     mut client: TcpStream,
     peer_addr: SocketAddr,
-    request: crate::http_proxy::ProxyRequest,
+    authority: String,
+    initial_client_bytes: Vec<u8>,
+    log_kind: &'static str,
+    reply: ReplyStyle,
 ) -> Result<()> {
-    let authority = request.authority().to_owned();
-
-    info!(%peer_addr, target = %authority, kind = request.log_kind(), "direct request");
+    info!(%peer_addr, target = %authority, kind = log_kind, "direct request");
 
     let mut upstream = match TcpStream::connect(&authority).await {
         Ok(upstream) => upstream,
         Err(err) => {
-            let _ = write_http_error(&mut client, "502 Bad Gateway").await;
+            reply.write_error(&mut client).await;
             return Err(err).with_context(|| format!("failed to connect target {authority}"));
         }
     };
 
-    let is_connect = request.is_connect();
-    let initial_client_bytes = request.initial_client_bytes();
-
-    if is_connect {
-        client
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await
-            .context("write CONNECT success response failed")?;
-    }
+    reply.write_success(&mut client).await?;
 
     if !initial_client_bytes.is_empty() {
         upstream

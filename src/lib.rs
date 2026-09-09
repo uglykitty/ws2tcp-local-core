@@ -4,6 +4,7 @@ mod http_proxy;
 mod routing_rules;
 pub mod service;
 pub mod settings;
+mod socks5;
 mod tls;
 mod tunnel;
 

@@ -1,7 +1,7 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc};
 
 use anyhow::{Result, anyhow};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -10,7 +10,7 @@ use crate::{
     gateway::Gateway,
     routing_rules::RoutingRules,
     settings::Settings,
-    tunnel::{Config, handle_client},
+    tunnel::{Config, handle_client, handle_socks_client},
 };
 
 pub async fn run_proxy(settings: Settings, shutdown: impl Future<Output = ()>) -> Result<()> {
@@ -50,8 +50,23 @@ pub async fn run_proxy_with_mode_updates(
         .map_err(|err| anyhow!("failed to bind {}: {err}", settings.listen))?;
     let listen_addr = listener.local_addr().unwrap_or(settings.listen);
 
+    let socks_listener = match settings.socks_listen {
+        Some(addr) => Some(
+            TcpListener::bind(addr)
+                .await
+                .map_err(|err| anyhow!("failed to bind SOCKS5 listener {addr}: {err}"))?,
+        ),
+        None => None,
+    };
+    let socks_listen_addr = socks_listener.as_ref().map(|listener| {
+        listener
+            .local_addr()
+            .unwrap_or_else(|_| settings.socks_listen.unwrap())
+    });
+
     info!(
         listen = %listen_addr,
+        socks_listen = %socks_listen_addr.map(|addr| addr.to_string()).unwrap_or_else(|| "disabled".to_owned()),
         gateway = %config.gateway.base(),
         insecure = config.insecure,
         rule_refresh_interval_secs = settings.rule_refresh_interval.as_secs(),
@@ -80,12 +95,33 @@ pub async fn run_proxy_with_mode_updates(
                     }
                 });
             }
+            accept_result = accept_optional(&socks_listener), if socks_listener.is_some() => {
+                let (stream, peer_addr) = accept_result
+                    .map_err(|err| anyhow!("SOCKS5 accept failed: {err}"))?;
+                let config = Arc::clone(&config);
+
+                tokio::spawn(async move {
+                    if let Err(err) = handle_socks_client(stream, peer_addr, config).await {
+                        warn!(%peer_addr, error = %format_args!("{err:#}"), "SOCKS5 connection closed with error");
+                    }
+                });
+            }
             _ = &mut shutdown => {
                 info!("shutdown requested");
                 return Ok(());
             }
         }
     }
+}
+
+async fn accept_optional(
+    listener: &Option<TcpListener>,
+) -> std::io::Result<(TcpStream, SocketAddr)> {
+    listener
+        .as_ref()
+        .expect("accept_optional is only polled when the listener is Some")
+        .accept()
+        .await
 }
 
 fn pin_shutdown<F>(shutdown: F) -> Pin<Box<F>>
