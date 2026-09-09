@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.6 - 2026-09-09
+
+### Added
+
+- Added an optional local SOCKS5 listener (`Settings.socks_listen`), sharing
+  the same gateway, routing rules, and proxy mode as the existing HTTP
+  listener. Only the no-authentication SOCKS5 method is supported;
+  domain-name targets (ATYP 0x03) are forwarded as hostnames rather than
+  resolved locally, matching `socks5h` semantics. Disabled unless
+  `socks_listen` is set.
+
 ## 0.1.5 - 2026-09-07
 
 ### Removed
