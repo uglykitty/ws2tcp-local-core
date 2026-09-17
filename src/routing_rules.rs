@@ -26,12 +26,26 @@ const GFWLIST_URLS: &[&str] = &[PRIMARY_GFWLIST_URL, FALLBACK_GFWLIST_URL];
 const CACHE_DIR_NAME: &str = "ws2tcp-local";
 const GFWLIST_CACHE_FILE: &str = "gfwlist.txt";
 
+fn build_http_client(client_label: Option<&str>) -> Client {
+    let core_id = concat!("ws2tcp-local-core/", env!("CARGO_PKG_VERSION"));
+    let user_agent = match client_label.map(str::trim) {
+        Some(label) if !label.is_empty() => format!("{core_id} ({label})"),
+        _ => core_id.to_owned(),
+    };
+
+    Client::builder()
+        .user_agent(user_agent)
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RoutingRules {
     state: Arc<RwLock<RoutingRulesState>>,
     generation: Arc<AtomicU64>,
     custom_domain_rules: Option<PathBuf>,
     refresh_interval: Duration,
+    client: Client,
 }
 
 #[derive(Debug, Clone)]
@@ -50,17 +64,22 @@ impl RoutingRules {
         proxy_mode: ProxyMode,
         custom_domain_rules: Option<&Path>,
         refresh_interval: Duration,
+        client_label: Option<&str>,
     ) -> Self {
+        let client = build_http_client(client_label);
+
         if proxy_mode == ProxyMode::Global {
             info!("using global proxy mode; skipping proxy routing rule download");
             return Self::new(
                 RoutingRulesState::GlobalProxy,
                 custom_domain_rules.map(Path::to_path_buf),
                 refresh_interval,
+                client,
             );
         }
 
-        let mut loader = AutoRuleLoader::new(custom_domain_rules.map(Path::to_path_buf));
+        let mut loader =
+            AutoRuleLoader::new(custom_domain_rules.map(Path::to_path_buf), client.clone());
         let state = match loader.load_state().await {
             Ok(state) => state,
             Err(err) => {
@@ -78,6 +97,7 @@ impl RoutingRules {
             state,
             custom_domain_rules.map(Path::to_path_buf),
             refresh_interval,
+            client,
         );
         rules.spawn_auto_refresh(loader, refresh_interval, 0);
         rules
@@ -87,12 +107,14 @@ impl RoutingRules {
         state: RoutingRulesState,
         custom_domain_rules: Option<PathBuf>,
         refresh_interval: Duration,
+        client: Client,
     ) -> Self {
         Self {
             state: Arc::new(RwLock::new(state)),
             generation: Arc::new(AtomicU64::new(0)),
             custom_domain_rules,
             refresh_interval,
+            client,
         }
     }
 
@@ -146,7 +168,10 @@ impl RoutingRules {
             ProxyMode::Auto => {
                 let rules = self.clone();
                 tokio::spawn(async move {
-                    let mut loader = AutoRuleLoader::new(rules.custom_domain_rules.clone());
+                    let mut loader = AutoRuleLoader::new(
+                        rules.custom_domain_rules.clone(),
+                        rules.client.clone(),
+                    );
                     match loader.load_state().await {
                         Ok(next_state) => {
                             if rules.generation.load(Ordering::Acquire) != generation {
@@ -197,6 +222,7 @@ struct AutoRuleLoader {
     custom_domain_rules: Option<PathBuf>,
     custom_cache: Option<CustomDomainRulesCache>,
     gfwlist_cache: GfwlistCache,
+    client: Client,
 }
 
 #[derive(Debug, Clone)]
@@ -215,11 +241,12 @@ enum GfwlistCache {
 }
 
 impl AutoRuleLoader {
-    fn new(custom_domain_rules: Option<PathBuf>) -> Self {
+    fn new(custom_domain_rules: Option<PathBuf>, client: Client) -> Self {
         Self {
             custom_domain_rules,
             custom_cache: None,
             gfwlist_cache: GfwlistCache::new(),
+            client,
         }
     }
 
@@ -233,7 +260,7 @@ impl AutoRuleLoader {
     }
 
     async fn download_and_parse(&mut self) -> Result<(DomainRules, &'static str)> {
-        let (body, source) = self.gfwlist_cache.load_gfwlist_body().await?;
+        let (body, source) = self.gfwlist_cache.load_gfwlist_body(&self.client).await?;
 
         let mut rules = parse_gfwlist(&body)?;
         if let Some(custom_domains) = self.load_custom_domain_rules()? {
@@ -395,9 +422,8 @@ impl GfwlistCache {
         };
     }
 
-    async fn load_gfwlist_body(&mut self) -> Result<(Vec<u8>, &'static str)> {
-        let client = Client::new();
-        let (remote_modified, head_source) = fetch_remote_last_modified(&client).await?;
+    async fn load_gfwlist_body(&mut self, client: &Client) -> Result<(Vec<u8>, &'static str)> {
+        let (remote_modified, head_source) = fetch_remote_last_modified(client).await?;
 
         if let Self::Disk(cache_path) = self {
             let cached = match remote_modified {
@@ -431,7 +457,7 @@ impl GfwlistCache {
             return Ok((body, head_source));
         }
 
-        let (body, downloaded_modified, get_source) = download_gfwlist_body(&client).await?;
+        let (body, downloaded_modified, get_source) = download_gfwlist_body(client).await?;
         // Only reuse the HEAD timestamp when the GET hit the same source;
         // timestamps across mirrors are not comparable.
         let effective_modified = downloaded_modified.or(if get_source == head_source {
@@ -902,7 +928,7 @@ bad:domain
         let path = temp_custom_rules_path("custom-cache-reuses-unchanged");
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         write_custom_rules_at(&path, ".first.example\n", modified);
-        let mut loader = AutoRuleLoader::new(Some(path.clone()));
+        let mut loader = AutoRuleLoader::new(Some(path.clone()), Client::new());
 
         let first = loader.load_custom_domain_rules().unwrap().unwrap();
         write_custom_rules_at(&path, ".second.example\n", modified);
@@ -920,7 +946,7 @@ bad:domain
         let first_modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let second_modified = first_modified + Duration::from_secs(2);
         write_custom_rules_at(&path, ".first.example\n", first_modified);
-        let mut loader = AutoRuleLoader::new(Some(path.clone()));
+        let mut loader = AutoRuleLoader::new(Some(path.clone()), Client::new());
 
         let first = loader.load_custom_domain_rules().unwrap().unwrap();
         write_custom_rules_at(&path, ".second.example\n", second_modified);
@@ -978,6 +1004,7 @@ bad:domain
             RoutingRulesState::GlobalProxy,
             None,
             Duration::from_secs(60),
+            Client::new(),
         );
 
         assert!(rules.should_proxy_host("example.com"));
@@ -994,6 +1021,7 @@ bad:domain
             ProxyMode::Global,
             Some(Path::new("/definitely/missing/custom-domains.txt")),
             Duration::from_secs(60),
+            None,
         )
         .await;
 
@@ -1007,6 +1035,7 @@ bad:domain
             RoutingRulesState::DirectFallback,
             None,
             Duration::from_secs(60),
+            Client::new(),
         );
 
         assert!(!rules.should_proxy_host("example.com"));
@@ -1025,6 +1054,7 @@ bad:domain
             RoutingRulesState::DirectFallback,
             None,
             Duration::from_secs(60),
+            Client::new(),
         );
 
         rules.set_mode(ProxyMode::Global);

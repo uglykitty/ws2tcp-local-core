@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.7 - 2026-09-17
+
+### Added
+
+- Added `Settings.client_label`, an optional identifier for the embedding
+  frontend (e.g. `cli/0.1.18`, `ws2tcp-local-qt/0.3.2`). When set, it is
+  included in the `User-Agent` header sent with gfwlist HTTP requests, so the
+  server can tell which frontend is making the request. Not user-configurable
+  via `--config`/CLI flags; callers set it directly on `Settings` after
+  `resolve()`.
+
 ## 0.1.6 - 2026-09-09
 
 ### Added

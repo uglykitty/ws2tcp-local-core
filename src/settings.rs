@@ -31,6 +31,10 @@ pub struct Settings {
     pub rule_refresh_interval: Duration,
     pub proxy_mode: ProxyMode,
     pub insecure: bool,
+    /// Identifies the embedding frontend (e.g. "cli/0.1.17", "ws2tcp-local-qt/0.3.1")
+    /// in the User-Agent sent for outbound HTTP requests such as gfwlist downloads.
+    /// Not user-configurable; set by the caller after `resolve()`.
+    pub client_label: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -118,6 +122,7 @@ impl Settings {
             } else {
                 file_settings.insecure.unwrap_or(false)
             },
+            client_label: None,
         })
     }
 }

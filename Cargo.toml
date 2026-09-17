@@ -1,6 +1,6 @@
 [package]
 name = "ws2tcp-local-core"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "Core proxy library for ws2tcp-local."
 license = "MIT"
