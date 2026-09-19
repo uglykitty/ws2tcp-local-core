@@ -8,9 +8,10 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{
-    connect_async_tls_with_config,
+    Connector, connect_async_tls_with_config,
     tungstenite::{
         Message,
+        handshake::client::Request,
         http::{HeaderName, HeaderValue},
     },
 };
@@ -157,6 +158,36 @@ pub(crate) async fn handle_socks_client(
     .await
 }
 
+/// Builds the websocket handshake request sent to the gateway: the Basic Auth header (when
+/// configured) plus the caller-supplied custom headers.
+pub(crate) fn build_gateway_request(
+    ws_url: &str,
+    basic_auth: Option<&str>,
+    headers: &[(HeaderName, HeaderValue)],
+) -> Result<Request> {
+    let mut ws_request = ws_url
+        .into_client_request()
+        .with_context(|| format!("failed to build websocket request for {ws_url}"))?;
+    if let Some(basic_auth) = basic_auth {
+        ws_request.headers_mut().insert(
+            "authorization",
+            basic_auth
+                .parse()
+                .context("failed to build Basic authorization header")?,
+        );
+    }
+
+    for (name, value) in headers {
+        ws_request.headers_mut().insert(name.clone(), value.clone());
+    }
+
+    Ok(ws_request)
+}
+
+pub(crate) fn gateway_connector(insecure: bool) -> Option<Connector> {
+    insecure.then(insecure_websocket_connector)
+}
+
 async fn handle_gateway(
     mut client: TcpStream,
     peer_addr: SocketAddr,
@@ -170,28 +201,8 @@ async fn handle_gateway(
 
     info!(%peer_addr, target = %authority, gateway = %ws_url, kind = log_kind, "proxying request");
 
-    let mut ws_request = ws_url
-        .as_str()
-        .into_client_request()
-        .with_context(|| format!("failed to build websocket request for {ws_url}"))?;
-    if let Some(basic_auth) = &config.basic_auth {
-        ws_request.headers_mut().insert(
-            "authorization",
-            basic_auth
-                .parse()
-                .context("failed to build Basic authorization header")?,
-        );
-    }
-
-    for (name, value) in &config.headers {
-        ws_request.headers_mut().insert(name.clone(), value.clone());
-    }
-
-    let connector = if config.insecure {
-        Some(insecure_websocket_connector())
-    } else {
-        None
-    };
+    let ws_request = build_gateway_request(&ws_url, config.basic_auth.as_deref(), &config.headers)?;
+    let connector = gateway_connector(config.insecure);
     let (websocket, _) =
         match connect_async_tls_with_config(ws_request, None, false, connector).await {
             Ok(parts) => parts,

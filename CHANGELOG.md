@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.9 - 2026-09-19
+
+### Added
+
+- `run_proxy` and `run_proxy_with_mode_updates` now check the gateway before
+  loading routing rules or binding any port: a websocket handshake on the
+  gateway root, with the configured credentials, custom headers and TLS
+  settings, which must answer with the `ws2tcp-router` health check message.
+  On failure they return a `GatewayCheckError` inside the `anyhow::Error`
+  (`downcast_ref` it): `Unauthorized { credentials_configured }` for `401`, and
+  `Failed(reason)` for an unreachable gateway, a timeout (10 seconds), or a
+  gateway that does not answer like `ws2tcp-router`.
+
+- When the gateway's health check response carries an `X-Ws2tcp-Token` header,
+  the token is kept for the lifetime of the proxy and sent as the same header
+  on every tunnel request, next to the Basic Auth header (replacing any
+  custom header of that name). It is marked sensitive and never logged. A
+  gateway that sends no token is still accepted. `ws2tcp-router` does not
+  verify the token yet.
+
+### Changed
+
+- Embedders (such as `ws2tcp-local-ffi`) now get an error from `run_proxy`
+  when the gateway check fails, and need a `ws2tcp-router` that supports the
+  `/` health check.
+
 ## 0.1.8 - 2026-09-19
 
 ### Added

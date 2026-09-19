@@ -8,6 +8,7 @@ use tracing::{info, warn};
 use crate::{
     auth::remote_basic_auth,
     gateway::Gateway,
+    gateway_check::{check_gateway, headers_with_token},
     routing_rules::RoutingRules,
     settings::Settings,
     tunnel::{Config, handle_client, handle_socks_client},
@@ -25,6 +26,25 @@ pub async fn run_proxy_with_mode_updates(
 ) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // Fail fast, before fetching routing rules or binding any port, when the gateway cannot be
+    // used (most importantly, when its Basic Auth credentials are wrong).
+    let gateway = Gateway::parse(&settings.gateway)?;
+    let basic_auth = remote_basic_auth(settings.basic_auth)?;
+    let health = check_gateway(
+        &gateway,
+        basic_auth.as_deref(),
+        settings.insecure,
+        &settings.headers,
+    )
+    .await?;
+    info!(
+        gateway = %gateway.base(),
+        token_received = health.token.is_some(),
+        "gateway health check passed"
+    );
+    // Tunnel requests carry the token next to Basic Auth. The router ignores it for now.
+    let headers = headers_with_token(settings.headers, health.token);
+
     let routing_rules = RoutingRules::load(
         settings.proxy_mode,
         settings.custom_domain_rules.as_deref(),
@@ -33,12 +53,12 @@ pub async fn run_proxy_with_mode_updates(
     .await;
 
     let config = Arc::new(Config {
-        gateway: Gateway::parse(&settings.gateway)?,
-        basic_auth: remote_basic_auth(settings.basic_auth)?,
+        gateway,
+        basic_auth,
         buffer_size: settings.buffer_size,
         routing_rules,
         insecure: settings.insecure,
-        headers: settings.headers,
+        headers,
     });
     let dynamic_routing_rules = config.routing_rules.clone();
     tokio::spawn(async move {

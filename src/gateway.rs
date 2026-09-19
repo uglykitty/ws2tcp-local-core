@@ -26,6 +26,11 @@ impl Gateway {
         &self.base
     }
 
+    /// The gateway root, which ws2tcp-router answers with its health check.
+    pub(crate) fn health_check_url(&self) -> String {
+        format!("{}/", self.base)
+    }
+
     pub(crate) fn target_url(&self, authority: &str) -> String {
         format!("{}/tcp:{}", self.base, authority)
     }
@@ -42,6 +47,22 @@ mod tests {
         assert_eq!(
             gateway.target_url("www.google.com:443"),
             "wss://1.2.3.4/gw/tcp:www.google.com:443"
+        );
+    }
+
+    #[test]
+    fn builds_health_check_url() {
+        assert_eq!(
+            Gateway::parse("wss://1.2.3.4/gw/")
+                .unwrap()
+                .health_check_url(),
+            "wss://1.2.3.4/gw/"
+        );
+        assert_eq!(
+            Gateway::parse("ws://1.2.3.4:8000")
+                .unwrap()
+                .health_check_url(),
+            "ws://1.2.3.4:8000/"
         );
     }
 }
