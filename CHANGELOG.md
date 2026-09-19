@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.8 - 2026-09-19
+
+### Added
+
+- Added `Settings.headers` and `Settings::add_header`, letting embedding
+  frontends send custom headers (for example `User-Agent`) on the gateway
+  websocket handshake. Adding the same name again replaces the earlier value;
+  headers owned by the websocket handshake (`Host`, `Connection`, `Upgrade`,
+  `Sec-WebSocket-*`) are rejected.
+
+### Removed
+
+- Removed `Settings.client_label`; use `Settings::add_header("User-Agent", ..)`
+  instead. gfwlist HTTP requests now send only `ws2tcp-local-core/<version>`.
+
 ## 0.1.7 - 2026-09-17
 
 ### Added

@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 
 pub const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:3128";
@@ -31,10 +32,34 @@ pub struct Settings {
     pub rule_refresh_interval: Duration,
     pub proxy_mode: ProxyMode,
     pub insecure: bool,
-    /// Identifies the embedding frontend (e.g. "cli/0.1.17", "ws2tcp-local-qt/0.3.1")
-    /// in the User-Agent sent for outbound HTTP requests such as gfwlist downloads.
-    /// Not user-configurable; set by the caller after `resolve()`.
-    pub client_label: Option<String>,
+    /// Extra headers sent on the gateway websocket handshake. Not configurable via
+    /// `--config`/CLI flags; embedding frontends add them after `resolve()` with
+    /// [`Settings::add_header`] (e.g. to identify themselves via `User-Agent`).
+    pub headers: Vec<(HeaderName, HeaderValue)>,
+}
+
+impl Settings {
+    /// Adds a header to the gateway websocket handshake. Adding the same name
+    /// again replaces the earlier value. Headers that belong to the websocket
+    /// handshake itself (`Host`, `Connection`, `Upgrade`, `Sec-WebSocket-*`) are
+    /// rejected; `Authorization` may be overridden.
+    pub fn add_header(&mut self, name: &str, value: &str) -> Result<()> {
+        let name = HeaderName::from_bytes(name.trim().as_bytes())
+            .with_context(|| format!("invalid header name {name:?}"))?;
+        let value = HeaderValue::from_str(value)
+            .with_context(|| format!("invalid value for header {name}"))?;
+
+        let lowered = name.as_str();
+        if matches!(lowered, "host" | "connection" | "upgrade")
+            || lowered.starts_with("sec-websocket-")
+        {
+            bail!("header {name} is reserved for the websocket handshake");
+        }
+
+        self.headers.retain(|(existing, _)| *existing != name);
+        self.headers.push((name, value));
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -122,7 +147,7 @@ impl Settings {
             } else {
                 file_settings.insecure.unwrap_or(false)
             },
-            client_label: None,
+            headers: Vec::new(),
         })
     }
 }
@@ -163,6 +188,46 @@ mod tests {
             proxy_mode: None,
             insecure: false,
         }
+    }
+
+    fn empty_settings() -> Settings {
+        Settings {
+            listen: DEFAULT_LISTEN.parse().unwrap(),
+            socks_listen: None,
+            gateway: "ws://example.com".to_owned(),
+            basic_auth: None,
+            buffer_size: DEFAULT_BUFFER_SIZE,
+            log_level: None,
+            custom_domain_rules: None,
+            rule_refresh_interval: Duration::from_secs(DEFAULT_RULE_REFRESH_INTERVAL_SECS),
+            proxy_mode: ProxyMode::Global,
+            insecure: false,
+            headers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn add_header_replaces_same_name() {
+        let mut settings = empty_settings();
+        settings.add_header("User-Agent", "first").unwrap();
+        settings.add_header("user-agent", "second").unwrap();
+        settings.add_header("X-Extra", "1").unwrap();
+
+        assert_eq!(settings.headers.len(), 2);
+        assert_eq!(settings.headers[0].0, "user-agent");
+        assert_eq!(settings.headers[0].1, "second");
+        assert_eq!(settings.headers[1].0, "x-extra");
+    }
+
+    #[test]
+    fn add_header_rejects_invalid_and_reserved() {
+        let mut settings = empty_settings();
+        assert!(settings.add_header("bad name", "x").is_err());
+        assert!(settings.add_header("X-Bad", "line\nbreak").is_err());
+        assert!(settings.add_header("Host", "x").is_err());
+        assert!(settings.add_header("Upgrade", "x").is_err());
+        assert!(settings.add_header("Sec-WebSocket-Key", "x").is_err());
+        assert!(settings.headers.is_empty());
     }
 
     #[test]

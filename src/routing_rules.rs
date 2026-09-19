@@ -26,15 +26,9 @@ const GFWLIST_URLS: &[&str] = &[PRIMARY_GFWLIST_URL, FALLBACK_GFWLIST_URL];
 const CACHE_DIR_NAME: &str = "ws2tcp-local";
 const GFWLIST_CACHE_FILE: &str = "gfwlist.txt";
 
-fn build_http_client(client_label: Option<&str>) -> Client {
-    let core_id = concat!("ws2tcp-local-core/", env!("CARGO_PKG_VERSION"));
-    let user_agent = match client_label.map(str::trim) {
-        Some(label) if !label.is_empty() => format!("{core_id} ({label})"),
-        _ => core_id.to_owned(),
-    };
-
+fn build_http_client() -> Client {
     Client::builder()
-        .user_agent(user_agent)
+        .user_agent(concat!("ws2tcp-local-core/", env!("CARGO_PKG_VERSION")))
         .build()
         .unwrap_or_else(|_| Client::new())
 }
@@ -64,9 +58,8 @@ impl RoutingRules {
         proxy_mode: ProxyMode,
         custom_domain_rules: Option<&Path>,
         refresh_interval: Duration,
-        client_label: Option<&str>,
     ) -> Self {
-        let client = build_http_client(client_label);
+        let client = build_http_client();
 
         if proxy_mode == ProxyMode::Global {
             info!("using global proxy mode; skipping proxy routing rule download");
@@ -1021,7 +1014,6 @@ bad:domain
             ProxyMode::Global,
             Some(Path::new("/definitely/missing/custom-domains.txt")),
             Duration::from_secs(60),
-            None,
         )
         .await;
 

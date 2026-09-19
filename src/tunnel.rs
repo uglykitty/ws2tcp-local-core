@@ -7,7 +7,13 @@ use tokio::{
     net::TcpStream,
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async_tls_with_config,
+    tungstenite::{
+        Message,
+        http::{HeaderName, HeaderValue},
+    },
+};
 use tracing::{debug, info};
 
 use crate::{
@@ -25,6 +31,7 @@ pub(crate) struct Config {
     pub(crate) buffer_size: usize,
     pub(crate) routing_rules: RoutingRules,
     pub(crate) insecure: bool,
+    pub(crate) headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 /// How to acknowledge a tunneled connection to the client, which differs by the
@@ -174,6 +181,10 @@ async fn handle_gateway(
                 .parse()
                 .context("failed to build Basic authorization header")?,
         );
+    }
+
+    for (name, value) in &config.headers {
+        ws_request.headers_mut().insert(name.clone(), value.clone());
     }
 
     let connector = if config.insecure {

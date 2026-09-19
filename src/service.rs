@@ -29,7 +29,6 @@ pub async fn run_proxy_with_mode_updates(
         settings.proxy_mode,
         settings.custom_domain_rules.as_deref(),
         settings.rule_refresh_interval,
-        settings.client_label.as_deref(),
     )
     .await;
 
@@ -39,6 +38,7 @@ pub async fn run_proxy_with_mode_updates(
         buffer_size: settings.buffer_size,
         routing_rules,
         insecure: settings.insecure,
+        headers: settings.headers,
     });
     let dynamic_routing_rules = config.routing_rules.clone();
     tokio::spawn(async move {
