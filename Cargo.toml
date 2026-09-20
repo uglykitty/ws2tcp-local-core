@@ -1,6 +1,6 @@
 [package]
 name = "ws2tcp-local-core"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2024"
 description = "Core proxy library for ws2tcp-local."
 license = "MIT"
@@ -29,6 +29,7 @@ httpdate = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tokio = { version = "1.45", features = ["rt", "macros", "net", "io-util", "sync", "time"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"

@@ -20,6 +20,24 @@ pub enum ProxyMode {
     Global,
 }
 
+/// How the client authenticates to the gateway. Exactly one is used at a time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthMode {
+    /// No health check: log in for an access token on startup (the login is the check), then
+    /// open tunnels with `Bearer` tokens that are renewed as needed. Needs a gateway with token
+    /// authentication (a `ws2tcp-router` has it when its Basic credentials are configured). The
+    /// default.
+    ///
+    /// Logging in takes credentials. Without any there is nothing to log in with, and the
+    /// gateway is used anonymously, after a health check.
+    #[default]
+    Token,
+    /// A health check on startup, then Basic Auth on every connection. Kept for compatibility
+    /// with gateways that have no token authentication, and to be phased out.
+    Basic,
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub listen: SocketAddr,
@@ -32,6 +50,7 @@ pub struct Settings {
     pub rule_refresh_interval: Duration,
     pub proxy_mode: ProxyMode,
     pub insecure: bool,
+    pub auth_mode: AuthMode,
     /// Extra headers sent on the gateway websocket handshake. Not configurable via
     /// `--config`/CLI flags; embedding frontends add them after `resolve()` with
     /// [`Settings::add_header`] (e.g. to identify themselves via `User-Agent`).
@@ -74,6 +93,7 @@ struct FileSettings {
     rule_refresh_interval_secs: Option<u64>,
     proxy_mode: Option<ProxyMode>,
     insecure: Option<bool>,
+    auth_mode: Option<AuthMode>,
 }
 
 #[derive(Debug, Default)]
@@ -89,6 +109,7 @@ pub struct SettingsOverrides {
     pub rule_refresh_interval_secs: Option<u64>,
     pub proxy_mode: Option<ProxyMode>,
     pub insecure: bool,
+    pub auth_mode: Option<AuthMode>,
 }
 
 impl Settings {
@@ -147,6 +168,10 @@ impl Settings {
             } else {
                 file_settings.insecure.unwrap_or(false)
             },
+            auth_mode: overrides
+                .auth_mode
+                .or(file_settings.auth_mode)
+                .unwrap_or_default(),
             headers: Vec::new(),
         })
     }
@@ -187,6 +212,7 @@ mod tests {
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
+            auth_mode: None,
         }
     }
 
@@ -202,6 +228,7 @@ mod tests {
             rule_refresh_interval: Duration::from_secs(DEFAULT_RULE_REFRESH_INTERVAL_SECS),
             proxy_mode: ProxyMode::Global,
             insecure: false,
+            auth_mode: AuthMode::Basic,
             headers: Vec::new(),
         }
     }
@@ -249,6 +276,7 @@ mod tests {
             rule_refresh_interval_secs: Some(30),
             proxy_mode: Some(ProxyMode::Global),
             insecure: true,
+            auth_mode: None,
         })
         .unwrap();
 
@@ -301,6 +329,7 @@ insecure = true
             rule_refresh_interval_secs: Some(30),
             proxy_mode: Some(ProxyMode::Global),
             insecure: false,
+            auth_mode: None,
         })
         .unwrap();
         let _ = fs::remove_file(&config_path);
@@ -372,6 +401,7 @@ insecure = true
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
+            auth_mode: None,
         })
         .unwrap();
 
@@ -392,6 +422,7 @@ insecure = true
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
+            auth_mode: None,
         })
         .unwrap();
 
@@ -412,6 +443,7 @@ insecure = true
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
+            auth_mode: None,
         })
         .unwrap();
 
@@ -432,6 +464,7 @@ insecure = true
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
+            auth_mode: None,
         })
         .unwrap();
 
@@ -456,8 +489,49 @@ insecure = true
                 rule_refresh_interval_secs: Some(0),
                 proxy_mode: None,
                 insecure: false,
+                auth_mode: None,
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn auth_mode_defaults_to_token_and_can_come_from_the_file_or_the_flag() {
+        let resolve = |config: Option<PathBuf>, flag: Option<AuthMode>| {
+            Settings::resolve(SettingsOverrides {
+                config,
+                gateway: Some("wss://example.com/ws".to_owned()),
+                auth_mode: flag,
+                ..SettingsOverrides::default()
+            })
+            .unwrap()
+            .auth_mode
+        };
+
+        assert_eq!(resolve(None, None), AuthMode::Token);
+        assert_eq!(resolve(None, Some(AuthMode::Basic)), AuthMode::Basic);
+
+        let config_path = std::env::temp_dir().join(format!(
+            "ws2tcp-local-test-{}-auth-mode.toml",
+            std::process::id()
+        ));
+        fs::write(&config_path, "auth_mode = \"basic\"\n").unwrap();
+        assert_eq!(resolve(Some(config_path.clone()), None), AuthMode::Basic);
+        // The command line wins over the file.
+        assert_eq!(
+            resolve(Some(config_path.clone()), Some(AuthMode::Token)),
+            AuthMode::Token
+        );
+
+        fs::write(&config_path, "auth_mode = \"both\"\n").unwrap();
+        assert!(
+            Settings::resolve(SettingsOverrides {
+                config: Some(config_path.clone()),
+                gateway: Some("wss://example.com/ws".to_owned()),
+                ..SettingsOverrides::default()
+            })
+            .is_err()
+        );
+        let _ = fs::remove_file(&config_path);
     }
 }

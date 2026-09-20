@@ -8,11 +8,11 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{
-    Connector, connect_async_tls_with_config,
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
     tungstenite::{
-        Message,
+        Error as WsError, Message,
         handshake::client::Request,
-        http::{HeaderName, HeaderValue},
+        http::{HeaderName, HeaderValue, StatusCode},
     },
 };
 use tracing::{debug, info};
@@ -21,6 +21,7 @@ use crate::{
     gateway::Gateway,
     http_proxy::read_proxy_request,
     routing_rules::{RoutingRules, host_from_authority},
+    session::GatewayAuth,
     socks5::{self, read_socks5_request},
     tls::insecure_websocket_connector,
 };
@@ -28,7 +29,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) gateway: Gateway,
-    pub(crate) basic_auth: Option<String>,
+    pub(crate) auth: GatewayAuth,
     pub(crate) buffer_size: usize,
     pub(crate) routing_rules: RoutingRules,
     pub(crate) insecure: bool,
@@ -158,23 +159,24 @@ pub(crate) async fn handle_socks_client(
     .await
 }
 
-/// Builds the websocket handshake request sent to the gateway: the Basic Auth header (when
-/// configured) plus the caller-supplied custom headers.
+/// Builds the websocket handshake request sent to the gateway: the `Authorization` header (when
+/// there are credentials) plus the caller-supplied custom headers.
 pub(crate) fn build_gateway_request(
     ws_url: &str,
-    basic_auth: Option<&str>,
+    authorization: Option<&str>,
     headers: &[(HeaderName, HeaderValue)],
 ) -> Result<Request> {
     let mut ws_request = ws_url
         .into_client_request()
         .with_context(|| format!("failed to build websocket request for {ws_url}"))?;
-    if let Some(basic_auth) = basic_auth {
-        ws_request.headers_mut().insert(
-            "authorization",
-            basic_auth
-                .parse()
-                .context("failed to build Basic authorization header")?,
-        );
+    if let Some(authorization) = authorization {
+        let mut authorization: HeaderValue = authorization
+            .parse()
+            .context("failed to build authorization header")?;
+        authorization.set_sensitive(true);
+        ws_request
+            .headers_mut()
+            .insert("authorization", authorization);
     }
 
     for (name, value) in headers {
@@ -186,6 +188,37 @@ pub(crate) fn build_gateway_request(
 
 pub(crate) fn gateway_connector(insecure: bool) -> Option<Connector> {
     insecure.then(insecure_websocket_connector)
+}
+
+/// Opens the websocket tunnel to the gateway.
+///
+/// When the gateway refuses an access token (it restarted, or the login was revoked), the token is
+/// renewed and the request is tried once more.
+async fn connect_gateway(
+    config: &Config,
+    ws_url: &str,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    let mut renewed = false;
+    loop {
+        let authorization = config.auth.authorization().await?;
+        let request = build_gateway_request(ws_url, authorization.as_deref(), &config.headers)?;
+        let connector = gateway_connector(config.insecure);
+        match connect_async_tls_with_config(request, None, false, connector).await {
+            Ok((websocket, _)) => return Ok(websocket),
+            Err(WsError::Http(response))
+                if response.status() == StatusCode::UNAUTHORIZED
+                    && !renewed
+                    && config.auth.can_renew() =>
+            {
+                renewed = true;
+                debug!("gateway rejected the access token; renewing it");
+                config.auth.rejected(authorization.as_deref()).await;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to connect gateway {ws_url}"));
+            }
+        }
+    }
 }
 
 async fn handle_gateway(
@@ -201,16 +234,13 @@ async fn handle_gateway(
 
     info!(%peer_addr, target = %authority, gateway = %ws_url, kind = log_kind, "proxying request");
 
-    let ws_request = build_gateway_request(&ws_url, config.basic_auth.as_deref(), &config.headers)?;
-    let connector = gateway_connector(config.insecure);
-    let (websocket, _) =
-        match connect_async_tls_with_config(ws_request, None, false, connector).await {
-            Ok(parts) => parts,
-            Err(err) => {
-                reply.write_error(&mut client).await;
-                return Err(err).with_context(|| format!("failed to connect gateway {ws_url}"));
-            }
-        };
+    let websocket = match connect_gateway(&config, &ws_url).await {
+        Ok(websocket) => websocket,
+        Err(err) => {
+            reply.write_error(&mut client).await;
+            return Err(err);
+        }
+    };
 
     reply.write_success(&mut client).await?;
 

@@ -17,33 +17,8 @@ use crate::{
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Header on the health check response with the token the router hands out, and on every tunnel
-/// request that follows. The router does not verify the token yet.
-const TOKEN_HEADER: &str = "x-ws2tcp-token";
-
 /// What a ws2tcp-router health check (`GET <gateway>/`) answers with as its first message.
 const HEALTH_CHECK_MESSAGE_PREFIX: &str = "ok: ws2tcp-router";
-
-/// What the gateway reported in a successful startup check.
-#[derive(Debug)]
-pub(crate) struct GatewayHealth {
-    /// The token from the health check response, when the gateway sent one.
-    pub(crate) token: Option<HeaderValue>,
-}
-
-/// Returns `headers` extended with the gateway `token` (when there is one), replacing any header
-/// of the same name, so that it is sent on every tunnel request next to the Basic Auth header.
-pub(crate) fn headers_with_token(
-    mut headers: Vec<(HeaderName, HeaderValue)>,
-    token: Option<HeaderValue>,
-) -> Vec<(HeaderName, HeaderValue)> {
-    if let Some(token) = token {
-        let name = HeaderName::from_static(TOKEN_HEADER);
-        headers.retain(|(existing, _)| *existing != name);
-        headers.push((name, token));
-    }
-    headers
-}
 
 /// Why the startup check of the remote gateway failed. [`run_proxy`](crate::run_proxy) returns it
 /// inside an [`anyhow::Error`]; use `downcast_ref` to tell an authentication failure (which the
@@ -57,6 +32,10 @@ pub enum GatewayCheckError {
     },
     /// The gateway could not be reached, timed out, or did not answer like a ws2tcp-router.
     Failed(String),
+    /// In token mode, the token login that stands in for the health check failed for another
+    /// reason than rejected credentials: the gateway is unreachable, is not a ws2tcp-router, or
+    /// does not offer token authentication.
+    LoginFailed(String),
 }
 
 impl fmt::Display for GatewayCheckError {
@@ -77,6 +56,7 @@ impl fmt::Display for GatewayCheckError {
                  configured; set --basic-auth or WS2TCP_LOCAL_BASIC_AUTH"
             ),
             Self::Failed(reason) => write!(f, "gateway health check failed: {reason}"),
+            Self::LoginFailed(reason) => write!(f, "gateway token login failed: {reason}"),
         }
     }
 }
@@ -84,36 +64,28 @@ impl fmt::Display for GatewayCheckError {
 impl std::error::Error for GatewayCheckError {}
 
 /// Verifies the gateway before serving: performs a websocket handshake on the gateway root, with
-/// the same credentials, custom headers and TLS settings as real tunnels, and expects the
-/// ws2tcp-router health check message.
+/// the same Basic Auth credentials, custom headers and TLS settings as real tunnels, and expects
+/// the ws2tcp-router health check message. (The health check accepts Basic Auth even when the
+/// router requires tokens for tunnels.)
 pub(crate) async fn check_gateway(
     gateway: &Gateway,
     basic_auth: Option<&str>,
     insecure: bool,
     headers: &[(HeaderName, HeaderValue)],
-) -> Result<GatewayHealth, GatewayCheckError> {
+) -> Result<(), GatewayCheckError> {
     let url = gateway.health_check_url();
     let request = build_gateway_request(&url, basic_auth, headers)
         .map_err(|err| GatewayCheckError::Failed(format!("{err:#}")))?;
 
     let check = async {
-        let (mut websocket, response) =
+        let (mut websocket, _) =
             connect_async_tls_with_config(request, None, false, gateway_connector(insecure))
                 .await
                 .map_err(|err| classify_connect_error(err, basic_auth.is_some()))?;
-        let token = response
-            .headers()
-            .get(TOKEN_HEADER)
-            .cloned()
-            .map(|mut token| {
-                // Keep the token out of `Debug` output (and so out of logs).
-                token.set_sensitive(true);
-                token
-            });
 
         match websocket.next().await {
             Some(Ok(Message::Text(text))) if text.starts_with(HEALTH_CHECK_MESSAGE_PREFIX) => {
-                Ok(GatewayHealth { token })
+                Ok(())
             }
             Some(Ok(other)) => Err(GatewayCheckError::Failed(format!(
                 "unexpected reply from {url}: {other:?}"
@@ -185,8 +157,6 @@ mod tests {
         Router,
         /// Accepts the handshake, then sends an unrelated message.
         WrongReply,
-        /// Answers the health check message, but without a token header.
-        WithoutToken,
         /// Drops the connection without answering, like a router without the health check.
         Hangup,
     }
@@ -201,18 +171,6 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             match kind {
                 FakeGateway::Hangup => drop(stream),
-                FakeGateway::WithoutToken => {
-                    let mut ws =
-                        accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
-                            .await
-                            .unwrap();
-                    futures_util::SinkExt::send(
-                        &mut ws,
-                        Message::Text("ok: ws2tcp-router 0.0.0 is available".into()),
-                    )
-                    .await
-                    .unwrap();
-                }
                 FakeGateway::WrongReply => {
                     let mut ws =
                         accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
@@ -230,10 +188,6 @@ mod tests {
                                 .get("authorization")
                                 .is_some_and(|value| value == ALICE);
                             if authorized {
-                                let mut response = response;
-                                response
-                                    .headers_mut()
-                                    .insert(TOKEN_HEADER, HeaderValue::from_static("tok-123"));
                                 Ok(response)
                             } else {
                                 let mut error =
@@ -263,59 +217,36 @@ mod tests {
     #[tokio::test]
     async fn passes_with_correct_credentials() {
         let gateway = spawn_gateway(FakeGateway::Router).await;
-        let health = check_gateway(&gateway, Some(ALICE), false, &[])
+
+        check_gateway(&gateway, Some(ALICE), false, &[])
             .await
             .expect("health check should pass");
-
-        let token = health.token.expect("router hands out a token");
-        assert_eq!(token, "tok-123");
-        assert!(token.is_sensitive());
-    }
-
-    #[tokio::test]
-    async fn passes_without_a_token_from_the_gateway() {
-        let gateway = spawn_gateway(FakeGateway::WithoutToken).await;
-        let health = check_gateway(&gateway, None, false, &[])
-            .await
-            .expect("a gateway that sends no token is still usable");
-
-        assert!(health.token.is_none());
     }
 
     #[test]
-    fn tunnel_requests_carry_token_and_basic_auth() {
-        let user_agent = (
-            HeaderName::from_static("user-agent"),
-            HeaderValue::from_static("ws2tcp-local/test"),
-        );
-        let stale_token = (
-            HeaderName::from_static(TOKEN_HEADER),
-            HeaderValue::from_static("stale"),
-        );
-        let headers = headers_with_token(
-            vec![user_agent, stale_token],
-            Some(HeaderValue::from_static("tok-123")),
-        );
-
-        let request =
-            build_gateway_request("ws://gw.example/tcp:host:443", Some(ALICE), &headers).unwrap();
-        assert_eq!(request.headers().get("authorization").unwrap(), ALICE);
-        assert_eq!(request.headers().get(TOKEN_HEADER).unwrap(), "tok-123");
-        assert_eq!(
-            request.headers().get("user-agent").unwrap(),
-            "ws2tcp-local/test"
-        );
-        assert_eq!(request.headers().get_all(TOKEN_HEADER).iter().count(), 1);
-    }
-
-    #[test]
-    fn headers_are_unchanged_without_a_token() {
+    fn gateway_request_carries_the_authorization_and_custom_headers() {
         let headers = vec![(
             HeaderName::from_static("user-agent"),
             HeaderValue::from_static("ws2tcp-local/test"),
         )];
 
-        assert_eq!(headers_with_token(headers.clone(), None), headers);
+        let request =
+            build_gateway_request("ws://gw.example/tcp:host:443", Some(ALICE), &headers).unwrap();
+        assert_eq!(request.headers().get("authorization").unwrap(), ALICE);
+        assert!(
+            request
+                .headers()
+                .get("authorization")
+                .unwrap()
+                .is_sensitive()
+        );
+        assert_eq!(
+            request.headers().get("user-agent").unwrap(),
+            "ws2tcp-local/test"
+        );
+
+        let request = build_gateway_request("ws://gw.example/tcp:host:443", None, &[]).unwrap();
+        assert!(request.headers().get("authorization").is_none());
     }
 
     #[tokio::test]

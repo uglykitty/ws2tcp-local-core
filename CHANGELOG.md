@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.0 - 2026-09-20
+
+### Added
+
+- `Settings::auth_mode` (an `AuthMode`; also in `SettingsOverrides`, and `auth_mode` in the
+  config file) chooses how the client authenticates to the gateway, one method at a time:
+  - `AuthMode::Token`, the default: no health check. `run_proxy` logs in with the Basic Auth
+    credentials (`POST /auth/token`, over `http(s)://` on the gateway's host, port and path
+    prefix), and that login is the check. Tunnels use `Authorization: Bearer <access token>`,
+    renewed with the refresh token (`POST /auth/refresh`) once 80% of its lifetime is used,
+    by a background task that needs neither a tunnel nor the embedding application (it ends
+    with the session, runs at most once a second, and backs off from 5 seconds to 5 minutes
+    after failures); when the router refuses the refresh token (it expired, was revoked, or
+    the router restarted) the client logs in again. Tunnels still check the token when they
+    open, as a safety net: a token that is due is renewed first, a tunnel that the gateway
+    answers with `401` renews the token and is tried once more, and concurrent tunnels share
+    one renewal. There is no fallback to Basic Auth: rejected credentials fail with
+    `GatewayCheckError::Unauthorized`, and any other failure to log in with the new
+    `GatewayCheckError::LoginFailed`. Tokens are never logged.
+  - `AuthMode::Basic`: what `run_proxy` always did, the health check and Basic Auth on every
+    connection. Kept for compatibility with gateways that have no token authentication, and
+    to be phased out; it logs a warning on startup.
+
+### Changed
+
+- **`run_proxy` sends nothing at startup without credentials.** Authentication is not enabled,
+  so there is no health check and the proxy starts right away, in either mode. The health
+  check now only runs in `AuthMode::Basic` with credentials.
+- **The default is `AuthMode::Token`**, so a gateway without token authentication needs
+  `AuthMode::Basic`.
+- The health check no longer reads the `X-Ws2tcp-Token` response header, and tunnel requests no
+  longer send that header: `ws2tcp-router` replaced it with the real token authentication and
+  ignores it. `Authorization` header values are now marked sensitive.
+- New dependency: `serde_json`.
+- `Settings` and `SettingsOverrides` have a new field `auth_mode`, and `GatewayCheckError` a
+  new variant `LoginFailed`: code that builds these structs or matches the enum exhaustively
+  needs updating.
+
 ## 0.1.9 - 2026-09-19
 
 ### Added
