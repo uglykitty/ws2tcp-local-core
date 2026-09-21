@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.0 - 2026-09-21
+
+### Added
+
+- `Settings::upstream_proxy` (an `UpstreamProxy`; `SettingsOverrides::upstream_proxy` and
+  `upstream_proxy` in the config file) makes every connection to the gateway go through a proxy
+  server: the tunnels, the health check and the token requests. `UpstreamProxy::parse` accepts
+  `http://` (an HTTP proxy, used with `CONNECT`), `socks5h://` (the proxy resolves hostnames) and
+  `socks5://` (hostnames are resolved locally) URLs, with optional percent-encoded `user:pass@`
+  credentials. Requests that a routing rule sends direct do not use it, and the proxy environment
+  variables are ignored. Logs and errors name the proxy but never show its credentials. A blank
+  value means no proxy, and in `SettingsOverrides` overrides one from the file.
+
+### Changed
+
+- **`Settings` has a new public field, `upstream_proxy`**, so code that builds it with a struct
+  literal has to set it (`None` for no proxy).
+
 ## 0.2.0 - 2026-09-20
 
 ### Added
