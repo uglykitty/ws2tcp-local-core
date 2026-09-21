@@ -22,7 +22,7 @@ use tracing::{debug, info};
 use crate::{
     gateway::Gateway,
     http_proxy::read_proxy_request,
-    routing_rules::{RoutingRules, host_from_authority},
+    routing_rules::{RoutingRules, host_from_authority, split_authority},
     session::GatewayAuth,
     socks5::{self, read_socks5_request},
     tls::insecure_websocket_connector,
@@ -108,6 +108,7 @@ pub(crate) async fn handle_client(
             initial_client_bytes,
             log_kind,
             reply,
+            config.upstream_proxy.as_deref(),
         )
         .await;
     }
@@ -147,6 +148,7 @@ pub(crate) async fn handle_socks_client(
             Vec::new(),
             "socks5",
             ReplyStyle::Socks5,
+            config.upstream_proxy.as_deref(),
         )
         .await;
     }
@@ -283,6 +285,9 @@ async fn handle_gateway(
     proxy(client, websocket, initial_client_bytes, config.buffer_size).await
 }
 
+/// Serves a request that no routing rule sends to the gateway: it connects to the target itself,
+/// through the upstream proxy when there is one, so that no connection leaves the machine
+/// around it.
 async fn handle_direct(
     mut client: TcpStream,
     peer_addr: SocketAddr,
@@ -290,10 +295,24 @@ async fn handle_direct(
     initial_client_bytes: Vec<u8>,
     log_kind: &'static str,
     reply: ReplyStyle,
+    upstream_proxy: Option<&UpstreamProxy>,
 ) -> Result<()> {
-    info!(%peer_addr, target = %authority, kind = log_kind, "direct request");
+    info!(
+        %peer_addr,
+        target = %authority,
+        kind = log_kind,
+        via_upstream_proxy = upstream_proxy.is_some(),
+        "direct request"
+    );
 
-    let mut upstream = match TcpStream::connect(&authority).await {
+    let connected = match upstream_proxy {
+        Some(upstream_proxy) => match split_authority(&authority) {
+            Ok((host, port)) => upstream_proxy.connect(host, port).await,
+            Err(err) => Err(std::io::Error::other(err)),
+        },
+        None => TcpStream::connect(&authority).await,
+    };
+    let mut upstream = match connected {
         Ok(upstream) => upstream,
         Err(err) => {
             reply.write_error(&mut client).await;
@@ -385,4 +404,150 @@ async fn proxy(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    const CONNECTED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+
+    /// Returns the end of a client connection that `handle_direct` serves, and the client's end.
+    async fn client_connection() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (served, _) = listener.accept().await.unwrap();
+        (served, client)
+    }
+
+    /// Accepts one connection, reads a `\r\n\r\n`-terminated header or, without one, four bytes
+    /// and echoes back four bytes. Returns what it received first.
+    async fn echo_once(mut stream: TcpStream, expect_connect: bool) -> String {
+        let mut received = Vec::new();
+        let mut byte = [0_u8; 1];
+        if expect_connect {
+            while !received.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                received.push(byte[0]);
+            }
+            stream.write_all(CONNECTED).await.unwrap();
+        }
+        let mut payload = [0_u8; 4];
+        stream.read_exact(&mut payload).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+        String::from_utf8(received).unwrap()
+    }
+
+    #[tokio::test]
+    async fn direct_requests_go_through_the_upstream_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy =
+            UpstreamProxy::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let fake_proxy = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            echo_once(stream, true).await
+        });
+        let (served, mut client) = client_connection().await;
+        let peer_addr = client.local_addr().unwrap();
+        let handler = tokio::spawn(async move {
+            handle_direct(
+                served,
+                peer_addr,
+                // Does not resolve: it can only be reached through the proxy.
+                "target.invalid:9000".to_owned(),
+                Vec::new(),
+                "test",
+                ReplyStyle::HttpConnect,
+                Some(&proxy),
+            )
+            .await
+        });
+
+        let mut reply = vec![0_u8; CONNECTED.len()];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, CONNECTED);
+        client.write_all(b"ping").await.unwrap();
+        let mut echoed = [0_u8; 4];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+        drop(client);
+
+        assert!(
+            fake_proxy
+                .await
+                .unwrap()
+                .starts_with("CONNECT target.invalid:9000 HTTP/1.1\r\n")
+        );
+        handler.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_requests_fail_with_502_when_the_upstream_proxy_is_unusable() {
+        let dead = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let proxy = UpstreamProxy::parse(&format!("socks5h://user:secret@{dead}")).unwrap();
+        let (served, mut client) = client_connection().await;
+        let peer_addr = client.local_addr().unwrap();
+
+        let err = handle_direct(
+            served,
+            peer_addr,
+            "example.com:443".to_owned(),
+            Vec::new(),
+            "test",
+            ReplyStyle::HttpConnect,
+            Some(&proxy),
+        )
+        .await
+        .unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(message.contains(&format!("socks5h://{dead}")), "{message}");
+        assert!(!message.contains("secret"), "{message}");
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn direct_requests_connect_to_the_target_without_an_upstream_proxy() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let authority = target.local_addr().unwrap().to_string();
+        let fake_target = tokio::spawn(async move {
+            let (stream, _) = target.accept().await.unwrap();
+            echo_once(stream, false).await
+        });
+        let (served, mut client) = client_connection().await;
+        let peer_addr = client.local_addr().unwrap();
+        let handler = tokio::spawn(async move {
+            handle_direct(
+                served,
+                peer_addr,
+                authority,
+                Vec::new(),
+                "test",
+                ReplyStyle::HttpConnect,
+                None,
+            )
+            .await
+        });
+
+        let mut reply = vec![0_u8; CONNECTED.len()];
+        client.read_exact(&mut reply).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut echoed = [0_u8; 4];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+        drop(client);
+
+        fake_target.await.unwrap();
+        handler.await.unwrap().unwrap();
+    }
 }

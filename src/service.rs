@@ -33,7 +33,7 @@ pub async fn run_proxy_with_mode_updates(
     let gateway = Gateway::parse(&settings.gateway)?;
     let upstream_proxy = settings.upstream_proxy.map(Arc::new);
     if let Some(upstream_proxy) = &upstream_proxy {
-        info!(upstream_proxy = %upstream_proxy, "connecting to the gateway through an upstream proxy");
+        info!(upstream_proxy = %upstream_proxy, "all outgoing connections go through an upstream proxy");
     }
     let auth = match (settings.auth_mode, remote_basic_auth(settings.basic_auth)?) {
         // Authentication is not enabled: there is nothing to log in with, or to check credentials
@@ -74,8 +74,9 @@ pub async fn run_proxy_with_mode_updates(
         settings.proxy_mode,
         settings.custom_domain_rules.as_deref(),
         settings.rule_refresh_interval,
+        upstream_proxy.as_deref(),
     )
-    .await;
+    .await?;
 
     let config = Arc::new(Config {
         gateway,

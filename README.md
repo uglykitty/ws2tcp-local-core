@@ -111,12 +111,13 @@ Tokens are never logged, and the `Authorization` header values are marked sensit
 
 ## Upstream proxy
 
-`Settings::upstream_proxy` makes every connection to the gateway (the tunnels, the health check and
-the token requests) go through a proxy server. Parse it with `UpstreamProxy::parse`, which accepts
+`Settings::upstream_proxy` makes all outgoing connections go through a proxy server: to the gateway
+(the tunnels, the health check and the token requests), the requests that a routing rule sends
+direct, and the downloads of the rule lists. Parse it with `UpstreamProxy::parse`, which accepts
 `http://` (an HTTP proxy, used with `CONNECT`), `socks5h://` (the proxy resolves hostnames) and
-`socks5://` (hostnames are resolved locally) URLs with optional `user:pass@` credentials. Requests
-that a routing rule sends direct do not use it, and the proxy environment variables are ignored.
-Logs and errors show the proxy's address and never its credentials.
+`socks5://` (hostnames are resolved locally) URLs with optional `user:pass@` credentials. The proxy
+environment variables are ignored while it is set. Logs and errors show the proxy's address and
+never its credentials.
 
 ## License
 

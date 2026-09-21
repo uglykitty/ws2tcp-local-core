@@ -18,7 +18,7 @@ use reqwest::{
 };
 use tracing::{info, warn};
 
-use crate::settings::ProxyMode;
+use crate::{settings::ProxyMode, upstream::UpstreamProxy};
 
 const PRIMARY_GFWLIST_URL: &str = "https://wangguofang.net/raw.githubusercontent.com/gfwlist/gfwlist/refs/heads/master/gfwlist.txt";
 const FALLBACK_GFWLIST_URL: &str = "https://gitlab.com/gfwlist/gfwlist/raw/master/gfwlist.txt";
@@ -26,11 +26,22 @@ const GFWLIST_URLS: &[&str] = &[PRIMARY_GFWLIST_URL, FALLBACK_GFWLIST_URL];
 const CACHE_DIR_NAME: &str = "ws2tcp-local";
 const GFWLIST_CACHE_FILE: &str = "gfwlist.txt";
 
-fn build_http_client() -> Client {
-    Client::builder()
-        .user_agent(concat!("ws2tcp-local-core/", env!("CARGO_PKG_VERSION")))
+/// The client that downloads the rule lists. With an upstream proxy it goes through that proxy and
+/// ignores the proxy environment variables; failing to set that up is an error, not a reason to
+/// connect directly.
+fn build_http_client(upstream_proxy: Option<&UpstreamProxy>) -> Result<Client> {
+    let mut client =
+        Client::builder().user_agent(concat!("ws2tcp-local-core/", env!("CARGO_PKG_VERSION")));
+    if let Some(upstream_proxy) = upstream_proxy {
+        client = client.no_proxy().proxy(
+            upstream_proxy
+                .to_reqwest()
+                .map_err(|err| anyhow!("invalid upstream proxy: {}", err.without_url()))?,
+        );
+    }
+    client
         .build()
-        .unwrap_or_else(|_| Client::new())
+        .map_err(|err| anyhow!("failed to build the rule list client: {err}"))
 }
 
 #[derive(Debug, Clone)]
@@ -58,17 +69,18 @@ impl RoutingRules {
         proxy_mode: ProxyMode,
         custom_domain_rules: Option<&Path>,
         refresh_interval: Duration,
-    ) -> Self {
-        let client = build_http_client();
+        upstream_proxy: Option<&UpstreamProxy>,
+    ) -> Result<Self> {
+        let client = build_http_client(upstream_proxy)?;
 
         if proxy_mode == ProxyMode::Global {
             info!("using global proxy mode; skipping proxy routing rule download");
-            return Self::new(
+            return Ok(Self::new(
                 RoutingRulesState::GlobalProxy,
                 custom_domain_rules.map(Path::to_path_buf),
                 refresh_interval,
                 client,
-            );
+            ));
         }
 
         let mut loader =
@@ -93,7 +105,7 @@ impl RoutingRules {
             client,
         );
         rules.spawn_auto_refresh(loader, refresh_interval, 0);
-        rules
+        Ok(rules)
     }
 
     fn new(
@@ -849,6 +861,16 @@ pub(crate) fn host_from_authority(authority: &str) -> Result<&str> {
         .ok_or_else(|| anyhow!("authority must include :port"))
 }
 
+/// Splits `host:port` or `[ipv6]:port` into the host (without brackets) and the port.
+pub(crate) fn split_authority(authority: &str) -> Result<(&str, u16)> {
+    let host = host_from_authority(authority)?;
+    let port = authority
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .ok_or_else(|| anyhow!("authority must end with a numeric port"))?;
+    Ok((host, port))
+}
+
 impl std::fmt::Display for RoutingRules {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.mode())
@@ -1014,11 +1036,32 @@ bad:domain
             ProxyMode::Global,
             Some(Path::new("/definitely/missing/custom-domains.txt")),
             Duration::from_secs(60),
+            None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(rules.should_proxy_host("example.com"));
         assert_eq!(rules.to_string(), "global");
+    }
+
+    #[test]
+    fn splits_authorities_into_host_and_port() {
+        assert_eq!(
+            split_authority("example.com:443").unwrap(),
+            ("example.com", 443)
+        );
+        assert_eq!(split_authority("[::1]:8080").unwrap(), ("::1", 8080));
+        assert!(split_authority("example.com").is_err());
+        assert!(split_authority("example.com:https").is_err());
+    }
+
+    #[test]
+    fn the_rule_list_client_can_be_built_with_an_upstream_proxy() {
+        let proxy = UpstreamProxy::parse("socks5h://user:pass@127.0.0.1:1080").unwrap();
+
+        assert!(build_http_client(None).is_ok());
+        assert!(build_http_client(Some(&proxy)).is_ok());
     }
 
     #[test]

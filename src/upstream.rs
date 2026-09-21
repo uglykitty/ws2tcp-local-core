@@ -1,11 +1,11 @@
-//! An upstream proxy server that the connections to the gateway are made through.
+//! An upstream proxy server that all outgoing connections are made through.
 //!
 //! It is given as a URL: `http://[user:pass@]host[:port]` (an HTTP proxy, used with `CONNECT`),
 //! `socks5h://[user:pass@]host[:port]` (a SOCKS5 proxy that resolves hostnames itself) or
 //! `socks5://[user:pass@]host[:port]` (a SOCKS5 proxy for which hostnames are resolved locally).
-//! Everything that reaches the gateway uses it: the tunnels, the health check and the token
-//! requests. Requests that a routing rule sends direct do not: they bypass the gateway, and the
-//! upstream proxy with it.
+//! With one configured, nothing leaves the machine around it: the tunnels, the health check and the
+//! token requests to the gateway, the requests that a routing rule sends direct, and the downloads
+//! of the rule lists.
 
 use std::{fmt, io, time::Duration};
 

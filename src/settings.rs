@@ -53,8 +53,8 @@ pub struct Settings {
     pub proxy_mode: ProxyMode,
     pub insecure: bool,
     pub auth_mode: AuthMode,
-    /// A proxy server (`http://`, `socks5h://` or `socks5://`) that every connection to the
-    /// gateway is made through. Connections that a routing rule sends direct do not use it.
+    /// A proxy server (`http://`, `socks5h://` or `socks5://`) that all outgoing connections are
+    /// made through: to the gateway, direct requests, and the downloads of the rule lists.
     pub upstream_proxy: Option<UpstreamProxy>,
     /// Extra headers sent on the gateway websocket handshake. Not configurable via
     /// `--config`/CLI flags; embedding frontends add them after `resolve()` with
