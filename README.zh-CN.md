@@ -83,6 +83,14 @@ flowchart TD
 
 token 不会写入日志，`Authorization` 头的值也被标记为敏感。
 
+## 上游代理
+
+`Settings::upstream_proxy` 会让所有访问 gateway 的连接（隧道、健康检查和 token 请求）经过一个
+代理服务器。用 `UpstreamProxy::parse` 解析，支持 `http://`（HTTP 代理，使用 `CONNECT`）、
+`socks5h://`（由代理解析域名）和 `socks5://`（在本地解析域名）URL，可带 `user:pass@` 认证信息。
+被路由规则判定为直连的请求不经过它，也不会读取代理环境变量。日志和错误信息只显示代理地址，
+不显示认证信息。
+
 ## 许可证
 
 MIT。见 [`LICENSE`](LICENSE)。

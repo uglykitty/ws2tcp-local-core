@@ -31,19 +31,31 @@ pub async fn run_proxy_with_mode_updates(
     // used with the credentials (most importantly, when they are wrong). Token mode does that with
     // the login, basic mode with a health check.
     let gateway = Gateway::parse(&settings.gateway)?;
+    let upstream_proxy = settings.upstream_proxy.map(Arc::new);
+    if let Some(upstream_proxy) = &upstream_proxy {
+        info!(upstream_proxy = %upstream_proxy, "connecting to the gateway through an upstream proxy");
+    }
     let auth = match (settings.auth_mode, remote_basic_auth(settings.basic_auth)?) {
         // Authentication is not enabled: there is nothing to log in with, or to check credentials
         // against, so nothing is sent at startup.
         (_, None) => GatewayAuth::None,
         // No health check: the token login is the check.
         (AuthMode::Token, Some(basic_auth)) => {
-            GatewayAuth::login(&gateway, basic_auth, settings.insecure, &settings.headers).await?
+            GatewayAuth::login(
+                &gateway,
+                basic_auth,
+                settings.insecure,
+                upstream_proxy.as_deref(),
+                &settings.headers,
+            )
+            .await?
         }
         (AuthMode::Basic, Some(basic_auth)) => {
             check_gateway(
                 &gateway,
                 Some(&basic_auth),
                 settings.insecure,
+                upstream_proxy.as_deref(),
                 &settings.headers,
             )
             .await?;
@@ -71,6 +83,7 @@ pub async fn run_proxy_with_mode_updates(
         buffer_size: settings.buffer_size,
         routing_rules,
         insecure: settings.insecure,
+        upstream_proxy,
         headers,
     });
     let dynamic_routing_rules = config.routing_rules.clone();

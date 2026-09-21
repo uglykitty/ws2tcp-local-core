@@ -9,6 +9,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 
+use crate::upstream::UpstreamProxy;
+
 pub const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:3128";
 pub const DEFAULT_RULE_REFRESH_INTERVAL_SECS: u64 = 60;
@@ -51,6 +53,9 @@ pub struct Settings {
     pub proxy_mode: ProxyMode,
     pub insecure: bool,
     pub auth_mode: AuthMode,
+    /// A proxy server (`http://`, `socks5h://` or `socks5://`) that every connection to the
+    /// gateway is made through. Connections that a routing rule sends direct do not use it.
+    pub upstream_proxy: Option<UpstreamProxy>,
     /// Extra headers sent on the gateway websocket handshake. Not configurable via
     /// `--config`/CLI flags; embedding frontends add them after `resolve()` with
     /// [`Settings::add_header`] (e.g. to identify themselves via `User-Agent`).
@@ -94,6 +99,7 @@ struct FileSettings {
     proxy_mode: Option<ProxyMode>,
     insecure: Option<bool>,
     auth_mode: Option<AuthMode>,
+    upstream_proxy: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +116,8 @@ pub struct SettingsOverrides {
     pub proxy_mode: Option<ProxyMode>,
     pub insecure: bool,
     pub auth_mode: Option<AuthMode>,
+    /// A blank value means no upstream proxy, and overrides one from the file.
+    pub upstream_proxy: Option<String>,
 }
 
 impl Settings {
@@ -172,6 +180,12 @@ impl Settings {
                 .auth_mode
                 .or(file_settings.auth_mode)
                 .unwrap_or_default(),
+            upstream_proxy: UpstreamProxy::parse_optional(
+                overrides
+                    .upstream_proxy
+                    .or(file_settings.upstream_proxy)
+                    .as_deref(),
+            )?,
             headers: Vec::new(),
         })
     }
@@ -213,6 +227,7 @@ mod tests {
             proxy_mode: None,
             insecure: false,
             auth_mode: None,
+            upstream_proxy: None,
         }
     }
 
@@ -229,6 +244,7 @@ mod tests {
             proxy_mode: ProxyMode::Global,
             insecure: false,
             auth_mode: AuthMode::Basic,
+            upstream_proxy: None,
             headers: Vec::new(),
         }
     }
@@ -277,6 +293,7 @@ mod tests {
             proxy_mode: Some(ProxyMode::Global),
             insecure: true,
             auth_mode: None,
+            upstream_proxy: None,
         })
         .unwrap();
 
@@ -330,6 +347,7 @@ insecure = true
             proxy_mode: Some(ProxyMode::Global),
             insecure: false,
             auth_mode: None,
+            upstream_proxy: None,
         })
         .unwrap();
         let _ = fs::remove_file(&config_path);
@@ -402,6 +420,7 @@ insecure = true
             proxy_mode: None,
             insecure: false,
             auth_mode: None,
+            upstream_proxy: None,
         })
         .unwrap();
 
@@ -423,6 +442,7 @@ insecure = true
             proxy_mode: None,
             insecure: false,
             auth_mode: None,
+            upstream_proxy: None,
         })
         .unwrap();
 
@@ -444,6 +464,7 @@ insecure = true
             proxy_mode: None,
             insecure: false,
             auth_mode: None,
+            upstream_proxy: None,
         })
         .unwrap();
 
@@ -465,6 +486,7 @@ insecure = true
             proxy_mode: None,
             insecure: false,
             auth_mode: None,
+            upstream_proxy: None,
         })
         .unwrap();
 
@@ -490,6 +512,7 @@ insecure = true
                 proxy_mode: None,
                 insecure: false,
                 auth_mode: None,
+                upstream_proxy: None,
             })
             .is_err()
         );
@@ -532,6 +555,54 @@ insecure = true
             })
             .is_err()
         );
+        let _ = fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn upstream_proxy_comes_from_the_file_and_the_command_line_wins() {
+        let resolve = |config: Option<PathBuf>, flag: Option<&str>| {
+            Settings::resolve(SettingsOverrides {
+                config,
+                gateway: Some("wss://example.com/ws".to_owned()),
+                upstream_proxy: flag.map(str::to_owned),
+                ..SettingsOverrides::default()
+            })
+            .map(|settings| settings.upstream_proxy.map(|proxy| proxy.to_string()))
+        };
+
+        assert_eq!(resolve(None, None).unwrap(), None);
+        assert_eq!(
+            resolve(None, Some("socks5h://u:p@127.0.0.1:1080"))
+                .unwrap()
+                .as_deref(),
+            Some("socks5h://127.0.0.1:1080")
+        );
+        assert!(resolve(None, Some("ftp://127.0.0.1:21")).is_err());
+
+        let config_path = std::env::temp_dir().join(format!(
+            "ws2tcp-local-test-{}-upstream-proxy.toml",
+            std::process::id()
+        ));
+        fs::write(
+            &config_path,
+            "upstream_proxy = \"http://file.example:3128\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(Some(config_path.clone()), None).unwrap().as_deref(),
+            Some("http://file.example:3128")
+        );
+        assert_eq!(
+            resolve(
+                Some(config_path.clone()),
+                Some("socks5h://cli.example:1080")
+            )
+            .unwrap()
+            .as_deref(),
+            Some("socks5h://cli.example:1080")
+        );
+        // A blank value on the command line turns the proxy from the file off.
+        assert_eq!(resolve(Some(config_path.clone()), Some("")).unwrap(), None);
         let _ = fs::remove_file(&config_path);
     }
 }

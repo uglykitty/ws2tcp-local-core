@@ -2,17 +2,15 @@ use std::{fmt, io::ErrorKind, time::Duration};
 
 use futures_util::StreamExt;
 use tokio::time::timeout;
-use tokio_tungstenite::{
-    connect_async_tls_with_config,
-    tungstenite::{
-        Error as WsError, Message,
-        http::{HeaderName, HeaderValue, StatusCode},
-    },
+use tokio_tungstenite::tungstenite::{
+    Error as WsError, Message,
+    http::{HeaderName, HeaderValue, StatusCode},
 };
 
 use crate::{
     gateway::Gateway,
-    tunnel::{build_gateway_request, gateway_connector},
+    tunnel::{build_gateway_request, connect_websocket},
+    upstream::UpstreamProxy,
 };
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -71,6 +69,7 @@ pub(crate) async fn check_gateway(
     gateway: &Gateway,
     basic_auth: Option<&str>,
     insecure: bool,
+    upstream_proxy: Option<&UpstreamProxy>,
     headers: &[(HeaderName, HeaderValue)],
 ) -> Result<(), GatewayCheckError> {
     let url = gateway.health_check_url();
@@ -78,10 +77,9 @@ pub(crate) async fn check_gateway(
         .map_err(|err| GatewayCheckError::Failed(format!("{err:#}")))?;
 
     let check = async {
-        let (mut websocket, _) =
-            connect_async_tls_with_config(request, None, false, gateway_connector(insecure))
-                .await
-                .map_err(|err| classify_connect_error(err, basic_auth.is_some()))?;
+        let mut websocket = connect_websocket(request, insecure, upstream_proxy)
+            .await
+            .map_err(|err| classify_connect_error(err, basic_auth.is_some()))?;
 
         match websocket.next().await {
             Some(Ok(Message::Text(text))) if text.starts_with(HEALTH_CHECK_MESSAGE_PREFIX) => {
@@ -218,7 +216,7 @@ mod tests {
     async fn passes_with_correct_credentials() {
         let gateway = spawn_gateway(FakeGateway::Router).await;
 
-        check_gateway(&gateway, Some(ALICE), false, &[])
+        check_gateway(&gateway, Some(ALICE), false, None, &[])
             .await
             .expect("health check should pass");
     }
@@ -249,10 +247,92 @@ mod tests {
         assert!(request.headers().get("authorization").is_none());
     }
 
+    /// Forwards the connections of an HTTP proxy or SOCKS5 client (as told by the first byte) to
+    /// `target`, whatever host they ask for.
+    async fn spawn_forwarding_proxy(target: std::net::SocketAddr) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut first = [0_u8; 1];
+            client.peek(&mut first).await.unwrap();
+            if first[0] == 5 {
+                let mut greeting = [0_u8; 2];
+                client.read_exact(&mut greeting).await.unwrap();
+                let mut methods = vec![0_u8; greeting[1] as usize];
+                client.read_exact(&mut methods).await.unwrap();
+                client.write_all(&[5, 0]).await.unwrap();
+                let mut head = [0_u8; 5];
+                client.read_exact(&mut head).await.unwrap();
+                // Domain name: the length, the name and the port.
+                let mut rest = vec![0_u8; head[4] as usize + 2];
+                client.read_exact(&mut rest).await.unwrap();
+                client
+                    .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+            } else {
+                let mut head = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    client.read_exact(&mut byte).await.unwrap();
+                    head.push(byte[0]);
+                }
+                assert!(head.starts_with(b"CONNECT gateway.invalid:8000 HTTP/1.1"));
+                client
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            let mut upstream = tokio::net::TcpStream::connect(target).await.unwrap();
+            let _ = copy_bidirectional(&mut client, &mut upstream).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn checks_the_gateway_through_an_upstream_proxy() {
+        for scheme in ["http", "socks5h"] {
+            let real = spawn_gateway(FakeGateway::Router).await;
+            let target: std::net::SocketAddr =
+                real.base().trim_start_matches("ws://").parse().unwrap();
+            let proxy = spawn_forwarding_proxy(target).await;
+            let upstream_proxy = UpstreamProxy::parse(&format!("{scheme}://{proxy}")).unwrap();
+            // The gateway name does not resolve: it is only reachable through the proxy.
+            let gateway = Gateway::parse("ws://gateway.invalid:8000").unwrap();
+
+            check_gateway(&gateway, Some(ALICE), false, Some(&upstream_proxy), &[])
+                .await
+                .unwrap_or_else(|err| panic!("{scheme}: {err}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unusable_upstream_proxy_fails_the_check_naming_it() {
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let upstream_proxy = UpstreamProxy::parse(&format!("socks5h://u:secret@{addr}")).unwrap();
+        let gateway = Gateway::parse("ws://gateway.invalid:8000").unwrap();
+
+        let err = check_gateway(&gateway, None, false, Some(&upstream_proxy), &[])
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(err, GatewayCheckError::Failed(_)), "{message}");
+        assert!(message.contains(&format!("socks5h://{addr}")), "{message}");
+        assert!(!message.contains("secret"), "{message}");
+        assert!(!message.contains("health check does this"), "{message}");
+    }
+
     #[tokio::test]
     async fn reports_wrong_credentials() {
         let gateway = spawn_gateway(FakeGateway::Router).await;
-        let err = check_gateway(&gateway, Some("Basic YWxpY2U6d3Jvbmc="), false, &[])
+        let err = check_gateway(&gateway, Some("Basic YWxpY2U6d3Jvbmc="), false, None, &[])
             .await
             .unwrap_err();
 
@@ -274,7 +354,9 @@ mod tests {
     #[tokio::test]
     async fn reports_missing_credentials() {
         let gateway = spawn_gateway(FakeGateway::Router).await;
-        let err = check_gateway(&gateway, None, false, &[]).await.unwrap_err();
+        let err = check_gateway(&gateway, None, false, None, &[])
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -291,7 +373,9 @@ mod tests {
     #[tokio::test]
     async fn fails_on_unexpected_reply() {
         let gateway = spawn_gateway(FakeGateway::WrongReply).await;
-        let err = check_gateway(&gateway, None, false, &[]).await.unwrap_err();
+        let err = check_gateway(&gateway, None, false, None, &[])
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, GatewayCheckError::Failed(_)), "{err}");
     }
@@ -299,7 +383,9 @@ mod tests {
     #[tokio::test]
     async fn fails_when_gateway_hangs_up() {
         let gateway = spawn_gateway(FakeGateway::Hangup).await;
-        let err = check_gateway(&gateway, None, false, &[]).await.unwrap_err();
+        let err = check_gateway(&gateway, None, false, None, &[])
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, GatewayCheckError::Failed(_)), "{err}");
         assert!(
@@ -318,7 +404,9 @@ mod tests {
             .unwrap();
         let gateway = Gateway::parse(&format!("ws://{addr}")).unwrap();
 
-        let err = check_gateway(&gateway, None, false, &[]).await.unwrap_err();
+        let err = check_gateway(&gateway, None, false, None, &[])
+            .await
+            .unwrap_err();
         assert!(matches!(err, GatewayCheckError::Failed(_)), "{err}");
         assert!(!err.to_string().contains("health check does this"), "{err}");
     }

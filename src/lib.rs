@@ -9,6 +9,7 @@ pub mod settings;
 mod socks5;
 mod tls;
 mod tunnel;
+mod upstream;
 
 pub use gateway_check::GatewayCheckError;
 pub use service::{run_proxy, run_proxy_with_mode_updates};
@@ -16,3 +17,4 @@ pub use settings::{
     AuthMode, DEFAULT_BUFFER_SIZE, DEFAULT_LISTEN, DEFAULT_RULE_REFRESH_INTERVAL_SECS, ProxyMode,
     Settings, SettingsOverrides,
 };
+pub use upstream::UpstreamProxy;

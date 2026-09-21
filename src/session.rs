@@ -28,7 +28,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::{gateway::Gateway, gateway_check::GatewayCheckError};
+use crate::{gateway::Gateway, gateway_check::GatewayCheckError, upstream::UpstreamProxy};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Refuse to buffer a token response larger than this.
@@ -72,9 +72,10 @@ impl GatewayAuth {
         gateway: &Gateway,
         basic_auth: String,
         insecure: bool,
+        upstream_proxy: Option<&UpstreamProxy>,
         headers: &[(HeaderName, HeaderValue)],
     ) -> Result<Self, GatewayCheckError> {
-        let session = TokenSession::new(gateway, &basic_auth, insecure, headers)
+        let session = TokenSession::new(gateway, &basic_auth, insecure, upstream_proxy, headers)
             .map_err(|err| GatewayCheckError::LoginFailed(format!("{err:#}")))?;
         let login = {
             let mut state = session.state.lock().await;
@@ -210,6 +211,7 @@ impl TokenSession {
         gateway: &Gateway,
         basic_auth: &str,
         insecure: bool,
+        upstream_proxy: Option<&UpstreamProxy>,
         headers: &[(HeaderName, HeaderValue)],
     ) -> Result<Self> {
         let mut basic_auth = HeaderValue::from_str(basic_auth)
@@ -221,13 +223,22 @@ impl TokenSession {
             header_map.insert(name.clone(), value.clone());
         }
 
-        let client = Client::builder()
+        let mut client = Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .danger_accept_invalid_certs(insecure)
-            // Tunnels connect to the gateway directly, so the token requests do too.
+            // Tunnels connect to the gateway the way the settings say, and ignore the proxy
+            // environment variables, so the token requests do too.
             .no_proxy()
             // A redirect would send the credentials elsewhere.
-            .redirect(Policy::none())
+            .redirect(Policy::none());
+        if let Some(upstream_proxy) = upstream_proxy {
+            client = client.proxy(
+                upstream_proxy
+                    .to_reqwest()
+                    .map_err(|err| anyhow!("invalid upstream proxy: {}", err.without_url()))?,
+            );
+        }
+        let client = client
             .build()
             .map_err(|err| anyhow!("failed to build the token client: {err}"))?;
 
@@ -515,7 +526,7 @@ mod tests {
     }
 
     async fn login(gateway: &Gateway, basic_auth: &str) -> GatewayAuth {
-        GatewayAuth::login(gateway, basic_auth.to_owned(), false, &[])
+        GatewayAuth::login(gateway, basic_auth.to_owned(), false, None, &[])
             .await
             .expect("the login should work")
     }
@@ -626,6 +637,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_requests_go_through_the_upstream_proxy() {
+        // The fake "proxy" is the only thing listening; the gateway name does not resolve, so a
+        // login that succeeds cannot have been made directly.
+        let router = router_like(3600);
+        let (proxy, seen) = spawn_gateway(move |path, authorization| {
+            router(
+                path.strip_prefix("http://gateway.invalid:8000")
+                    .unwrap_or(path),
+                authorization,
+            )
+        })
+        .await;
+        let upstream_proxy =
+            UpstreamProxy::parse(&proxy.base().replace("ws://", "http://")).unwrap();
+        let gateway = Gateway::parse("ws://gateway.invalid:8000").unwrap();
+
+        let auth = GatewayAuth::login(
+            &gateway,
+            ALICE.to_owned(),
+            false,
+            Some(&upstream_proxy),
+            &[],
+        )
+        .await
+        .expect("the login should work through the proxy");
+
+        assert_eq!(
+            auth.authorization().await.unwrap().as_deref(),
+            Some("Bearer access-1")
+        );
+        assert_eq!(paths(&seen), ["http://gateway.invalid:8000/auth/token"]);
+    }
+
+    #[tokio::test]
     async fn concurrent_requests_share_one_renewal() {
         let (gateway, seen) = spawn_gateway(router_like(0)).await;
         let auth = login(&gateway, ALICE).await;
@@ -658,9 +703,15 @@ mod tests {
     #[tokio::test]
     async fn wrong_credentials_fail_the_login_as_unauthorized() {
         let (gateway, _) = spawn_gateway(router_like(600)).await;
-        let err = GatewayAuth::login(&gateway, "Basic YWxpY2U6d3Jvbmc=".to_owned(), false, &[])
-            .await
-            .unwrap_err();
+        let err = GatewayAuth::login(
+            &gateway,
+            "Basic YWxpY2U6d3Jvbmc=".to_owned(),
+            false,
+            None,
+            &[],
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -693,7 +744,7 @@ mod tests {
             HeaderValue::from_static("ws2tcp-local/test"),
         )];
         // The login fails (404), which is all this test needs of the response.
-        let _ = GatewayAuth::login(&gateway, ALICE.to_owned(), false, &headers).await;
+        let _ = GatewayAuth::login(&gateway, ALICE.to_owned(), false, None, &headers).await;
 
         let head = seen_head.await.unwrap();
         assert!(head.starts_with("post /auth/token http/1.1"), "{head}");
@@ -717,7 +768,7 @@ mod tests {
             },
         ] {
             let (gateway, seen) = spawn_gateway(move |_, _| response.clone()).await;
-            let err = GatewayAuth::login(&gateway, ALICE.to_owned(), false, &[])
+            let err = GatewayAuth::login(&gateway, ALICE.to_owned(), false, None, &[])
                 .await
                 .unwrap_err();
 
@@ -747,7 +798,7 @@ mod tests {
             .unwrap();
         let gateway = Gateway::parse(&format!("ws://{addr}")).unwrap();
 
-        let err = GatewayAuth::login(&gateway, ALICE.to_owned(), false, &[])
+        let err = GatewayAuth::login(&gateway, ALICE.to_owned(), false, None, &[])
             .await
             .unwrap_err();
         assert!(matches!(err, GatewayCheckError::LoginFailed(_)), "{err}");

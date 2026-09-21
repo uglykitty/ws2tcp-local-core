@@ -26,11 +26,13 @@ anyhow = "1.0"
 base64 = "0.22"
 futures-util = "0.3"
 httpdate = "1.0"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+percent-encoding = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks"] }
 rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.45", features = ["rt", "macros", "net", "io-util", "sync", "time"] }
+tokio-socks = "0.5"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
 tracing = "0.1"

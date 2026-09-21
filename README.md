@@ -109,6 +109,15 @@ flowchart TD
 
 Tokens are never logged, and the `Authorization` header values are marked sensitive.
 
+## Upstream proxy
+
+`Settings::upstream_proxy` makes every connection to the gateway (the tunnels, the health check and
+the token requests) go through a proxy server. Parse it with `UpstreamProxy::parse`, which accepts
+`http://` (an HTTP proxy, used with `CONNECT`), `socks5h://` (the proxy resolves hostnames) and
+`socks5://` (hostnames are resolved locally) URLs with optional `user:pass@` credentials. Requests
+that a routing rule sends direct do not use it, and the proxy environment variables are ignored.
+Logs and errors show the proxy's address and never its credentials.
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE).

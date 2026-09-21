@@ -8,9 +8,11 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
+    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
+    connect_async_tls_with_config,
     tungstenite::{
         Error as WsError, Message,
+        error::UrlError,
         handshake::client::Request,
         http::{HeaderName, HeaderValue, StatusCode},
     },
@@ -24,6 +26,7 @@ use crate::{
     session::GatewayAuth,
     socks5::{self, read_socks5_request},
     tls::insecure_websocket_connector,
+    upstream::UpstreamProxy,
 };
 
 #[derive(Debug, Clone)]
@@ -33,6 +36,7 @@ pub(crate) struct Config {
     pub(crate) buffer_size: usize,
     pub(crate) routing_rules: RoutingRules,
     pub(crate) insecure: bool,
+    pub(crate) upstream_proxy: Option<Arc<UpstreamProxy>>,
     pub(crate) headers: Vec<(HeaderName, HeaderValue)>,
 }
 
@@ -190,6 +194,39 @@ pub(crate) fn gateway_connector(insecure: bool) -> Option<Connector> {
     insecure.then(insecure_websocket_connector)
 }
 
+/// Performs the websocket handshake of `request`, connecting through the upstream proxy when there
+/// is one. The TLS handshake of a `wss` gateway runs inside the tunnel the proxy sets up, so the
+/// proxy sees only the gateway's address.
+pub(crate) async fn connect_websocket(
+    request: Request,
+    insecure: bool,
+    upstream_proxy: Option<&UpstreamProxy>,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, WsError> {
+    let connector = gateway_connector(insecure);
+    let Some(upstream_proxy) = upstream_proxy else {
+        return connect_async_tls_with_config(request, None, false, connector)
+            .await
+            .map(|(websocket, _)| websocket);
+    };
+
+    let uri = request.uri();
+    let host = uri.host().ok_or(WsError::Url(UrlError::NoHostName))?;
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        });
+    let stream = upstream_proxy
+        .connect(host, port)
+        .await
+        .map_err(WsError::Io)?;
+    client_async_tls_with_config(request, stream, None, connector)
+        .await
+        .map(|(websocket, _)| websocket)
+}
+
 /// Opens the websocket tunnel to the gateway.
 ///
 /// When the gateway refuses an access token (it restarted, or the login was revoked), the token is
@@ -202,9 +239,8 @@ async fn connect_gateway(
     loop {
         let authorization = config.auth.authorization().await?;
         let request = build_gateway_request(ws_url, authorization.as_deref(), &config.headers)?;
-        let connector = gateway_connector(config.insecure);
-        match connect_async_tls_with_config(request, None, false, connector).await {
-            Ok((websocket, _)) => return Ok(websocket),
+        match connect_websocket(request, config.insecure, config.upstream_proxy.as_deref()).await {
+            Ok(websocket) => return Ok(websocket),
             Err(WsError::Http(response))
                 if response.status() == StatusCode::UNAUTHORIZED
                     && !renewed
