@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1 - 2026-09-21
+
+### Fixed
+
+- **With `Settings::upstream_proxy` set, all outgoing connections go through it**, not only the
+  ones to the gateway. Requests that a routing rule sends direct are now connected by the
+  upstream proxy (`CONNECT`, or SOCKS5 with the hostname resolved by the proxy for `http://` and
+  `socks5h://`) instead of from the local machine, and the rule lists are downloaded through it
+  as well. Until now both bypassed it, so a machine with no direct network access could not
+  reach direct targets or load its rules. The rule list download also ignores the proxy
+  environment variables while an upstream proxy is set.
+
 ## 0.3.0 - 2026-09-21
 
 ### Added
