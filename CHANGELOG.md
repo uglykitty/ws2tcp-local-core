@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 - 2026-09-22
+
+### Added
+
+- **The SOCKS5 listener now accepts `UDP ASSOCIATE` (RFC 1928 §7)**, not only `CONNECT`. A
+  local UDP relay socket is opened and handed back to the client; each destination the
+  client's datagrams name gets its own tunnel, chosen by the same routing rules as `CONNECT`
+  targets — through the gateway on a `/udp:host:port` tunnel (mirroring `/tcp:host:port`) when
+  a rule proxies it, connected directly otherwise. Multiple destinations can be used within one
+  association. A tunnel with nothing in either direction for 60 seconds is closed, since UDP has
+  no close signal of its own; so is the whole association once its control connection closes.
+  Requires a gateway (`ws2tcp-router` 0.2.0 or later) that answers `/udp:` tunnels.
+
 ## 0.3.1 - 2026-09-21
 
 ### Fixed
