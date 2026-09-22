@@ -1,10 +1,12 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
-    net::TcpStream,
+    net::{TcpStream, UdpSocket},
+    sync::mpsc,
+    time::{Duration, timeout},
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{
@@ -24,10 +26,18 @@ use crate::{
     http_proxy::read_proxy_request,
     routing_rules::{RoutingRules, host_from_authority, split_authority},
     session::GatewayAuth,
-    socks5::{self, read_socks5_request},
+    socks5::{self, Socks5Command, read_socks5_request},
     tls::insecure_websocket_connector,
     upstream::UpstreamProxy,
 };
+
+/// How long a UDP ASSOCIATE session (the whole association, or one of its per-destination
+/// tunnels) may sit idle before it is torn down. UDP has no close signal, so something has
+/// to reclaim sessions nobody is using any more; the router applies the same default to its
+/// end of each `/udp:` tunnel.
+const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Large enough for the maximum possible UDP payload (65507 bytes over IPv4/IPv6).
+const UDP_DATAGRAM_BUFFER: usize = 65536;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
@@ -130,13 +140,21 @@ pub(crate) async fn handle_socks_client(
     peer_addr: SocketAddr,
     config: Arc<Config>,
 ) -> Result<()> {
-    let request = match read_socks5_request(&mut client).await {
-        Ok(request) => request,
+    let command = match read_socks5_request(&mut client).await {
+        Ok(command) => command,
         Err(err) => {
             let _ = client.write_all(&socks5::GENERAL_FAILURE_REPLY).await;
             return Err(err);
         }
     };
+
+    let request = match command {
+        Socks5Command::Connect(request) => request,
+        Socks5Command::UdpAssociate => {
+            return handle_socks_udp_associate(client, peer_addr, config).await;
+        }
+    };
+
     let host = host_from_authority(&request.authority)?;
     let should_proxy = config.routing_rules.should_proxy_host(host);
 
@@ -163,6 +181,119 @@ pub(crate) async fn handle_socks_client(
         config,
     )
     .await
+}
+
+/// Serves a SOCKS5 UDP ASSOCIATE session (RFC 1928 §7): a local UDP relay socket is opened
+/// and its address handed back to the client, which then exchanges SOCKS5-framed UDP
+/// datagrams with it for as long as `client` (the control connection) stays open. Each
+/// distinct destination seen in those datagrams gets its own tunnel — through the gateway
+/// when the routing rules say so, connected directly otherwise — mirroring how `/tcp:` and
+/// direct connections are chosen for CONNECT requests.
+async fn handle_socks_udp_associate(
+    mut client: TcpStream,
+    peer_addr: SocketAddr,
+    config: Arc<Config>,
+) -> Result<()> {
+    let bind_addr: SocketAddr = if peer_addr.is_ipv6() {
+        "[::1]:0"
+    } else {
+        "127.0.0.1:0"
+    }
+    .parse()
+    .expect("hardcoded address is valid");
+
+    let relay_socket = match UdpSocket::bind(bind_addr).await {
+        Ok(socket) => socket,
+        Err(err) => {
+            let _ = client.write_all(&socks5::GENERAL_FAILURE_REPLY).await;
+            return Err(err).context("failed to bind local UDP relay socket");
+        }
+    };
+    let relay_addr = relay_socket
+        .local_addr()
+        .context("failed to read local UDP relay socket address")?;
+    let relay_socket = Arc::new(relay_socket);
+
+    client
+        .write_all(&socks5::udp_associate_reply(relay_addr))
+        .await
+        .context("write SOCKS5 UDP ASSOCIATE reply failed")?;
+
+    info!(%peer_addr, relay = %relay_addr, "accepted SOCKS5 UDP ASSOCIATE");
+
+    // Senders feeding each destination's tunnel task, keyed by "host:port". Dropping a
+    // sender (when this function returns) ends its task's `recv()` loop.
+    let mut targets: HashMap<String, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    // The first datagram's source pins the association to that client, as recommended by
+    // RFC 1928 §7; datagrams from elsewhere are ignored rather than accepted as a hijack.
+    let mut client_addr: Option<SocketAddr> = None;
+    let mut recv_buffer = vec![0_u8; UDP_DATAGRAM_BUFFER];
+    let mut control_buffer = [0_u8; 1];
+
+    loop {
+        tokio::select! {
+            // The control connection has no more requests to send; reading it here only
+            // detects the client closing it, which is when RFC 1928 says the association
+            // ends.
+            read_result = client.read(&mut control_buffer) => {
+                match read_result {
+                    Ok(0) => {
+                        debug!(%peer_addr, "SOCKS5 UDP ASSOCIATE control connection closed");
+                        break;
+                    }
+                    Ok(_) => {} // Not part of the protocol; ignore.
+                    Err(err) => {
+                        debug!(%peer_addr, error = %err, "SOCKS5 UDP ASSOCIATE control connection error");
+                        break;
+                    }
+                }
+            }
+            recv_result = timeout(UDP_IDLE_TIMEOUT, relay_socket.recv_from(&mut recv_buffer)) => {
+                let Ok(recv_result) = recv_result else {
+                    debug!(%peer_addr, "SOCKS5 UDP ASSOCIATE idle timeout reached");
+                    break;
+                };
+                let (n, from) = recv_result.context("read UDP datagram from client failed")?;
+
+                match client_addr {
+                    Some(expected) if expected != from => continue,
+                    Some(_) => {}
+                    None => client_addr = Some(from),
+                }
+
+                let (host, port, payload) = match socks5::parse_udp_datagram(&recv_buffer[..n]) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        debug!(%peer_addr, error = %err, "dropping malformed SOCKS5 UDP datagram");
+                        continue;
+                    }
+                };
+
+                let key = format!("{host}:{port}");
+                let sender = if let Some(sender) = targets.get(&key) {
+                    sender.clone()
+                } else {
+                    let (tx, rx) = mpsc::channel(32);
+                    targets.insert(key, tx.clone());
+                    tokio::spawn(run_udp_target(
+                        Arc::clone(&config),
+                        host,
+                        port,
+                        rx,
+                        Arc::clone(&relay_socket),
+                        from,
+                    ));
+                    tx
+                };
+                // The target task exits (and its channel closes) once it is idle for too
+                // long; a send racing that shutdown is simply dropped, same as one more UDP
+                // packet arriving just as the real thing would time out.
+                let _ = sender.send(payload.to_vec()).await;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Builds the websocket handshake request sent to the gateway: the `Authorization` header (when
@@ -333,6 +464,166 @@ async fn handle_direct(
         .await
         .context("direct TCP proxy failed")?;
 
+    Ok(())
+}
+
+/// Owns one destination's UDP traffic within a SOCKS5 UDP ASSOCIATE session: everything
+/// `inbound` yields is one datagram to `host:port`, and everything that comes back is
+/// wrapped as a SOCKS5 UDP response datagram and sent to `client_addr` on `relay_socket`.
+/// Ends, dropping the tunnel, after `UDP_IDLE_TIMEOUT` passes with nothing in either
+/// direction, or when `inbound` closes (the association ended).
+async fn run_udp_target(
+    config: Arc<Config>,
+    host: String,
+    port: u16,
+    inbound: mpsc::Receiver<Vec<u8>>,
+    relay_socket: Arc<UdpSocket>,
+    client_addr: SocketAddr,
+) {
+    let authority = format!("{host}:{port}");
+    let should_proxy = config.routing_rules.should_proxy_host(&host);
+
+    let result = if should_proxy {
+        run_udp_target_gateway(&config, &host, port, &authority, inbound, &relay_socket, client_addr).await
+    } else {
+        run_udp_target_direct(&host, port, &authority, inbound, &relay_socket, client_addr).await
+    };
+
+    if let Err(err) = result {
+        debug!(target = %authority, error = %format_args!("{err:#}"), "SOCKS5 UDP target session ended");
+    }
+}
+
+/// Relays one destination's UDP datagrams through the gateway, over a `/udp:` tunnel
+/// dedicated to it.
+async fn run_udp_target_gateway(
+    config: &Config,
+    host: &str,
+    port: u16,
+    authority: &str,
+    mut inbound: mpsc::Receiver<Vec<u8>>,
+    relay_socket: &UdpSocket,
+    client_addr: SocketAddr,
+) -> Result<()> {
+    let ws_url = config.gateway.target_url_udp(authority);
+    info!(target = %authority, gateway = %ws_url, kind = "socks5-udp", "proxying UDP request");
+
+    let websocket = connect_gateway(config, &ws_url).await?;
+    let (mut ws_writer, mut ws_reader) = websocket.split();
+
+    loop {
+        tokio::select! {
+            payload = timeout(UDP_IDLE_TIMEOUT, inbound.recv()) => {
+                let Ok(payload) = payload else {
+                    debug!(target = %authority, "UDP gateway tunnel idle timeout reached");
+                    let _ = ws_writer.send(Message::Close(None)).await;
+                    break;
+                };
+                let Some(payload) = payload else { break };
+                ws_writer
+                    .send(Message::Binary(payload.into()))
+                    .await
+                    .context("send udp payload to websocket failed")?;
+            }
+            message = timeout(UDP_IDLE_TIMEOUT, ws_reader.next()) => {
+                let Ok(message) = message else {
+                    debug!(target = %authority, "UDP gateway tunnel idle timeout reached");
+                    let _ = ws_writer.send(Message::Close(None)).await;
+                    break;
+                };
+                match message {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        send_udp_datagram_to_client(relay_socket, host, port, &bytes, client_addr).await?;
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        send_udp_datagram_to_client(relay_socket, host, port, text.as_bytes(), client_addr).await?;
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        ws_writer.send(Message::Pong(payload)).await.context("send websocket pong failed")?;
+                    }
+                    Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+                    Some(Ok(Message::Close(frame))) => {
+                        debug!(?frame, target = %authority, "udp gateway tunnel websocket closed");
+                        break;
+                    }
+                    Some(Err(err)) => return Err(err).context("read websocket frame failed"),
+                    None => break,
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Relays one destination's UDP datagrams directly, without the gateway, through the
+/// upstream proxy when one is configured for the token/control-plane connections. A UDP
+/// upstream proxy is not something this codebase supports, so a direct UDP destination
+/// always goes out from this machine's own network interface.
+async fn run_udp_target_direct(
+    host: &str,
+    port: u16,
+    authority: &str,
+    mut inbound: mpsc::Receiver<Vec<u8>>,
+    relay_socket: &UdpSocket,
+    client_addr: SocketAddr,
+) -> Result<()> {
+    info!(target = %authority, kind = "socks5-udp", "direct UDP request");
+
+    let resolved = tokio::net::lookup_host(authority)
+        .await
+        .with_context(|| format!("failed to resolve udp target {authority}"))?
+        .next()
+        .ok_or_else(|| anyhow!("udp target {authority} did not resolve"))?;
+    let bind_addr = if resolved.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let upstream = UdpSocket::bind(bind_addr)
+        .await
+        .with_context(|| format!("failed to bind local UDP socket for {authority}"))?;
+    upstream
+        .connect(resolved)
+        .await
+        .with_context(|| format!("failed to connect udp socket to {authority}"))?;
+
+    let mut upstream_buffer = vec![0_u8; UDP_DATAGRAM_BUFFER];
+
+    loop {
+        tokio::select! {
+            payload = timeout(UDP_IDLE_TIMEOUT, inbound.recv()) => {
+                let Ok(payload) = payload else {
+                    debug!(target = %authority, "direct UDP session idle timeout reached");
+                    break;
+                };
+                let Some(payload) = payload else { break };
+                upstream.send(&payload).await.context("send udp payload to direct upstream failed")?;
+            }
+            read_result = timeout(UDP_IDLE_TIMEOUT, upstream.recv(&mut upstream_buffer)) => {
+                let Ok(read_result) = read_result else {
+                    debug!(target = %authority, "direct UDP session idle timeout reached");
+                    break;
+                };
+                let n = read_result.context("read udp datagram from direct upstream failed")?;
+                send_udp_datagram_to_client(relay_socket, host, port, &upstream_buffer[..n], client_addr).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Wraps `payload` as a SOCKS5 UDP response datagram claiming to be from `host:port` and
+/// sends it to the SOCKS5 client's address on the local relay socket.
+async fn send_udp_datagram_to_client(
+    relay_socket: &UdpSocket,
+    host: &str,
+    port: u16,
+    payload: &[u8],
+    client_addr: SocketAddr,
+) -> Result<()> {
+    let datagram = socks5::build_udp_datagram(host, port, payload);
+    relay_socket
+        .send_to(&datagram, client_addr)
+        .await
+        .context("send udp datagram to client failed")?;
     Ok(())
 }
 

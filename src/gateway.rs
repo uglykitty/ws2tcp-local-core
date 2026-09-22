@@ -47,6 +47,10 @@ impl Gateway {
     pub(crate) fn target_url(&self, authority: &str) -> String {
         format!("{}/tcp:{}", self.base, authority)
     }
+
+    pub(crate) fn target_url_udp(&self, authority: &str) -> String {
+        format!("{}/udp:{}", self.base, authority)
+    }
 }
 
 #[cfg(test)]
@@ -60,6 +64,16 @@ mod tests {
         assert_eq!(
             gateway.target_url("www.google.com:443"),
             "wss://1.2.3.4/gw/tcp:www.google.com:443"
+        );
+    }
+
+    #[test]
+    fn builds_gateway_target_url_udp() {
+        let gateway = Gateway::parse("wss://1.2.3.4/gw/").unwrap();
+
+        assert_eq!(
+            gateway.target_url_udp("8.8.8.8:53"),
+            "wss://1.2.3.4/gw/udp:8.8.8.8:53"
         );
     }
 
