@@ -69,6 +69,7 @@ pub(crate) async fn check_gateway(
     gateway: &Gateway,
     basic_auth: Option<&str>,
     insecure: bool,
+    http3: bool,
     upstream_proxy: Option<&UpstreamProxy>,
     headers: &[(HeaderName, HeaderValue)],
 ) -> Result<(), GatewayCheckError> {
@@ -77,7 +78,7 @@ pub(crate) async fn check_gateway(
         .map_err(|err| GatewayCheckError::Failed(format!("{err:#}")))?;
 
     let check = async {
-        let mut websocket = connect_websocket(request, insecure, upstream_proxy)
+        let mut websocket = connect_websocket(request, insecure, http3, upstream_proxy)
             .await
             .map_err(|err| classify_connect_error(err, basic_auth.is_some()))?;
 
@@ -216,7 +217,7 @@ mod tests {
     async fn passes_with_correct_credentials() {
         let gateway = spawn_gateway(FakeGateway::Router).await;
 
-        check_gateway(&gateway, Some(ALICE), false, None, &[])
+        check_gateway(&gateway, Some(ALICE), false, false, None, &[])
             .await
             .expect("health check should pass");
     }
@@ -303,9 +304,16 @@ mod tests {
             // The gateway name does not resolve: it is only reachable through the proxy.
             let gateway = Gateway::parse("ws://gateway.invalid:8000").unwrap();
 
-            check_gateway(&gateway, Some(ALICE), false, Some(&upstream_proxy), &[])
-                .await
-                .unwrap_or_else(|err| panic!("{scheme}: {err}"));
+            check_gateway(
+                &gateway,
+                Some(ALICE),
+                false,
+                false,
+                Some(&upstream_proxy),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{scheme}: {err}"));
         }
     }
 
@@ -319,7 +327,7 @@ mod tests {
         let upstream_proxy = UpstreamProxy::parse(&format!("socks5h://u:secret@{addr}")).unwrap();
         let gateway = Gateway::parse("ws://gateway.invalid:8000").unwrap();
 
-        let err = check_gateway(&gateway, None, false, Some(&upstream_proxy), &[])
+        let err = check_gateway(&gateway, None, false, false, Some(&upstream_proxy), &[])
             .await
             .unwrap_err();
         let message = err.to_string();
@@ -332,9 +340,16 @@ mod tests {
     #[tokio::test]
     async fn reports_wrong_credentials() {
         let gateway = spawn_gateway(FakeGateway::Router).await;
-        let err = check_gateway(&gateway, Some("Basic YWxpY2U6d3Jvbmc="), false, None, &[])
-            .await
-            .unwrap_err();
+        let err = check_gateway(
+            &gateway,
+            Some("Basic YWxpY2U6d3Jvbmc="),
+            false,
+            false,
+            None,
+            &[],
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -354,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn reports_missing_credentials() {
         let gateway = spawn_gateway(FakeGateway::Router).await;
-        let err = check_gateway(&gateway, None, false, None, &[])
+        let err = check_gateway(&gateway, None, false, false, None, &[])
             .await
             .unwrap_err();
 
@@ -373,7 +388,7 @@ mod tests {
     #[tokio::test]
     async fn fails_on_unexpected_reply() {
         let gateway = spawn_gateway(FakeGateway::WrongReply).await;
-        let err = check_gateway(&gateway, None, false, None, &[])
+        let err = check_gateway(&gateway, None, false, false, None, &[])
             .await
             .unwrap_err();
 
@@ -383,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn fails_when_gateway_hangs_up() {
         let gateway = spawn_gateway(FakeGateway::Hangup).await;
-        let err = check_gateway(&gateway, None, false, None, &[])
+        let err = check_gateway(&gateway, None, false, false, None, &[])
             .await
             .unwrap_err();
 
@@ -404,7 +419,7 @@ mod tests {
             .unwrap();
         let gateway = Gateway::parse(&format!("ws://{addr}")).unwrap();
 
-        let err = check_gateway(&gateway, None, false, None, &[])
+        let err = check_gateway(&gateway, None, false, false, None, &[])
             .await
             .unwrap_err();
         assert!(matches!(err, GatewayCheckError::Failed(_)), "{err}");

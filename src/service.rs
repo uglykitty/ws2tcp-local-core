@@ -35,6 +35,7 @@ pub async fn run_proxy_with_mode_updates(
     if let Some(upstream_proxy) = &upstream_proxy {
         info!(upstream_proxy = %upstream_proxy, "all outgoing connections go through an upstream proxy");
     }
+    let http3 = settings.http3 && http3_usable(&gateway, upstream_proxy.is_some());
     let auth = match (settings.auth_mode, remote_basic_auth(settings.basic_auth)?) {
         // Authentication is not enabled: there is nothing to log in with, or to check credentials
         // against, so nothing is sent at startup.
@@ -55,6 +56,7 @@ pub async fn run_proxy_with_mode_updates(
                 &gateway,
                 Some(&basic_auth),
                 settings.insecure,
+                http3,
                 upstream_proxy.as_deref(),
                 &settings.headers,
             )
@@ -84,6 +86,7 @@ pub async fn run_proxy_with_mode_updates(
         buffer_size: settings.buffer_size,
         routing_rules,
         insecure: settings.insecure,
+        http3,
         upstream_proxy,
         headers,
     });
@@ -117,6 +120,7 @@ pub async fn run_proxy_with_mode_updates(
         socks_listen = %socks_listen_addr.map(|addr| addr.to_string()).unwrap_or_else(|| "disabled".to_owned()),
         gateway = %config.gateway.base(),
         insecure = config.insecure,
+        http3 = config.http3,
         rule_refresh_interval_secs = settings.rule_refresh_interval.as_secs(),
         routing_rules = %config.routing_rules,
         routing_rules_detail = %config.routing_rules.describe(),
@@ -177,4 +181,20 @@ where
     F: Future<Output = ()>,
 {
     Box::pin(shutdown)
+}
+
+/// Whether `--http3` can apply, warning when it cannot: QUIC needs a `wss` gateway and a direct
+/// path to it.
+fn http3_usable(gateway: &Gateway, has_upstream_proxy: bool) -> bool {
+    if !gateway.base().starts_with("wss://") {
+        warn!("HTTP/3 is ignored because the gateway is not a wss:// URL");
+        false
+    } else if has_upstream_proxy {
+        warn!(
+            "HTTP/3 is ignored because an upstream proxy is configured; QUIC cannot pass through one"
+        );
+        false
+    } else {
+        true
+    }
 }

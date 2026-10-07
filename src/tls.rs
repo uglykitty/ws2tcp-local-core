@@ -63,3 +63,26 @@ pub(crate) fn insecure_websocket_connector() -> Connector {
 
     Connector::Rustls(Arc::new(config))
 }
+
+/// The TLS configuration of an HTTP/3 (QUIC) connection to the gateway: the same certificate
+/// verification as the websocket connector, with the `h3` ALPN protocol.
+pub(crate) fn http3_client_config(insecure: bool) -> anyhow::Result<quinn::ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?;
+    let mut config = if insecure {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoServerCertVerification))
+            .with_no_client_auth()
+    } else {
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+    config.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(config))?;
+    Ok(quinn::ClientConfig::new(Arc::new(quic)))
+}

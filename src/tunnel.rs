@@ -1,9 +1,19 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    io::IoSlice,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context as TaskContext, Poll},
+};
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
+    io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
+        copy_bidirectional,
+    },
     net::{TcpStream, UdpSocket},
     sync::mpsc,
     time::{Duration, timeout},
@@ -11,12 +21,12 @@ use tokio::{
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
-    connect_async_tls_with_config,
     tungstenite::{
         Error as WsError, Message,
         error::UrlError,
         handshake::client::Request,
         http::{HeaderName, HeaderValue, StatusCode},
+        protocol::Role,
     },
 };
 use tracing::{debug, info};
@@ -24,6 +34,7 @@ use tracing::{debug, info};
 use crate::{
     gateway::Gateway,
     http_proxy::read_proxy_request,
+    http3,
     routing_rules::{RoutingRules, host_from_authority, split_authority},
     session::GatewayAuth,
     socks5::{self, Socks5Command, read_socks5_request},
@@ -46,6 +57,7 @@ pub(crate) struct Config {
     pub(crate) buffer_size: usize,
     pub(crate) routing_rules: RoutingRules,
     pub(crate) insecure: bool,
+    pub(crate) http3: bool,
     pub(crate) upstream_proxy: Option<Arc<UpstreamProxy>>,
     pub(crate) headers: Vec<(HeaderName, HeaderValue)>,
 }
@@ -327,21 +339,111 @@ pub(crate) fn gateway_connector(insecure: bool) -> Option<Connector> {
     insecure.then(insecure_websocket_connector)
 }
 
+/// The transport under a gateway websocket: TCP (with TLS for `wss`), or a QUIC stream when the
+/// tunnel runs over HTTP/3.
+pub(crate) enum GatewayStream {
+    Tcp(TcpStream),
+    Http3(DuplexStream),
+}
+
+pub(crate) type GatewayWebSocket = WebSocketStream<MaybeTlsStream<GatewayStream>>;
+
+/// Names the transport a gateway websocket runs over, for the logs: `quic` when it is a stream of
+/// an HTTP/3 connection, `tcp` otherwise.
+fn gateway_transport(websocket: &GatewayWebSocket) -> &'static str {
+    if matches!(
+        websocket.get_ref(),
+        MaybeTlsStream::Plain(GatewayStream::Http3(_))
+    ) {
+        "quic"
+    } else {
+        "tcp"
+    }
+}
+
+impl AsyncRead for GatewayStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Http3(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for GatewayStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Http3(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    // `TcpStream` writes several buffers at once, which rustls uses to send TLS records in one
+    // go; keep that, as the websocket used to sit directly on the `TcpStream`.
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Http3(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Tcp(stream) => stream.is_write_vectored(),
+            Self::Http3(stream) => stream.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Http3(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Http3(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
 /// Performs the websocket handshake of `request`, connecting through the upstream proxy when there
 /// is one. The TLS handshake of a `wss` gateway runs inside the tunnel the proxy sets up, so the
 /// proxy sees only the gateway's address.
+///
+/// With `http3`, a `wss` gateway is tried over HTTP/3 first (QUIC cannot go through an upstream
+/// proxy, so there it is skipped) and TCP is the fallback.
 pub(crate) async fn connect_websocket(
     request: Request,
     insecure: bool,
+    http3: bool,
     upstream_proxy: Option<&UpstreamProxy>,
-) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, WsError> {
-    let connector = gateway_connector(insecure);
-    let Some(upstream_proxy) = upstream_proxy else {
-        return connect_async_tls_with_config(request, None, false, connector)
-            .await
-            .map(|(websocket, _)| websocket);
-    };
+) -> Result<GatewayWebSocket, WsError> {
+    if http3
+        && upstream_proxy.is_none()
+        && request.uri().scheme_str() == Some("wss")
+        && let Some(stream) = http3::connect(&request, insecure).await?
+    {
+        // The QUIC connection is already TLS-protected, and the handshake is done.
+        let stream = MaybeTlsStream::Plain(GatewayStream::Http3(stream));
+        return Ok(WebSocketStream::from_raw_socket(stream, Role::Client, None).await);
+    }
 
+    let connector = gateway_connector(insecure);
     let uri = request.uri();
     let host = uri.host().ok_or(WsError::Url(UrlError::NoHostName))?;
     let port = uri
@@ -351,11 +453,16 @@ pub(crate) async fn connect_websocket(
         } else {
             80
         });
-    let stream = upstream_proxy
-        .connect(host, port)
-        .await
-        .map_err(WsError::Io)?;
-    client_async_tls_with_config(request, stream, None, connector)
+    let stream = match upstream_proxy {
+        Some(upstream_proxy) => upstream_proxy.connect(host, port).await,
+        // The URL writes an IPv6 literal in brackets, which the resolver does not take (the
+        // websocket library strips them the same way when it dials).
+        None => {
+            TcpStream::connect((host.trim_start_matches('[').trim_end_matches(']'), port)).await
+        }
+    }
+    .map_err(WsError::Io)?;
+    client_async_tls_with_config(request, GatewayStream::Tcp(stream), None, connector)
         .await
         .map(|(websocket, _)| websocket)
 }
@@ -364,15 +471,19 @@ pub(crate) async fn connect_websocket(
 ///
 /// When the gateway refuses an access token (it restarted, or the login was revoked), the token is
 /// renewed and the request is tried once more.
-async fn connect_gateway(
-    config: &Config,
-    ws_url: &str,
-) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+async fn connect_gateway(config: &Config, ws_url: &str) -> Result<GatewayWebSocket> {
     let mut renewed = false;
     loop {
         let authorization = config.auth.authorization().await?;
         let request = build_gateway_request(ws_url, authorization.as_deref(), &config.headers)?;
-        match connect_websocket(request, config.insecure, config.upstream_proxy.as_deref()).await {
+        match connect_websocket(
+            request,
+            config.insecure,
+            config.http3,
+            config.upstream_proxy.as_deref(),
+        )
+        .await
+        {
             Ok(websocket) => return Ok(websocket),
             Err(WsError::Http(response))
                 if response.status() == StatusCode::UNAUTHORIZED
@@ -401,8 +512,6 @@ async fn handle_gateway(
 ) -> Result<()> {
     let ws_url = config.gateway.target_url(&authority);
 
-    info!(%peer_addr, target = %authority, gateway = %ws_url, kind = log_kind, "proxying request");
-
     let websocket = match connect_gateway(&config, &ws_url).await {
         Ok(websocket) => websocket,
         Err(err) => {
@@ -410,6 +519,14 @@ async fn handle_gateway(
             return Err(err);
         }
     };
+
+    info!(
+        %peer_addr,
+        target = %format_args!("tcp:{authority}"),
+        kind = log_kind,
+        transport = gateway_transport(&websocket),
+        "proxying request"
+    );
 
     reply.write_success(&mut client).await?;
 
@@ -430,7 +547,7 @@ async fn handle_direct(
 ) -> Result<()> {
     info!(
         %peer_addr,
-        target = %authority,
+        target = %format_args!("tcp:{authority}"),
         kind = log_kind,
         via_upstream_proxy = upstream_proxy.is_some(),
         "direct request"
@@ -484,7 +601,16 @@ async fn run_udp_target(
     let should_proxy = config.routing_rules.should_proxy_host(&host);
 
     let result = if should_proxy {
-        run_udp_target_gateway(&config, &host, port, &authority, inbound, &relay_socket, client_addr).await
+        run_udp_target_gateway(
+            &config,
+            &host,
+            port,
+            &authority,
+            inbound,
+            &relay_socket,
+            client_addr,
+        )
+        .await
     } else {
         run_udp_target_direct(&host, port, &authority, inbound, &relay_socket, client_addr).await
     };
@@ -506,9 +632,14 @@ async fn run_udp_target_gateway(
     client_addr: SocketAddr,
 ) -> Result<()> {
     let ws_url = config.gateway.target_url_udp(authority);
-    info!(target = %authority, gateway = %ws_url, kind = "socks5-udp", "proxying UDP request");
 
     let websocket = connect_gateway(config, &ws_url).await?;
+    info!(
+        target = %format_args!("udp:{authority}"),
+        kind = "socks5-udp",
+        transport = gateway_transport(&websocket),
+        "proxying UDP request"
+    );
     let (mut ws_writer, mut ws_reader) = websocket.split();
 
     loop {
@@ -568,14 +699,18 @@ async fn run_udp_target_direct(
     relay_socket: &UdpSocket,
     client_addr: SocketAddr,
 ) -> Result<()> {
-    info!(target = %authority, kind = "socks5-udp", "direct UDP request");
+    info!(target = %format_args!("udp:{authority}"), kind = "socks5-udp", "direct UDP request");
 
     let resolved = tokio::net::lookup_host(authority)
         .await
         .with_context(|| format!("failed to resolve udp target {authority}"))?
         .next()
         .ok_or_else(|| anyhow!("udp target {authority} did not resolve"))?;
-    let bind_addr = if resolved.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let bind_addr = if resolved.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let upstream = UdpSocket::bind(bind_addr)
         .await
         .with_context(|| format!("failed to bind local UDP socket for {authority}"))?;
@@ -637,7 +772,7 @@ async fn write_http_error(client: &mut TcpStream, status: &str) -> Result<()> {
 
 async fn proxy(
     client: TcpStream,
-    websocket: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    websocket: GatewayWebSocket,
     initial_client_bytes: Vec<u8>,
     buffer_size: usize,
 ) -> Result<()> {
@@ -731,6 +866,27 @@ mod tests {
         stream.read_exact(&mut payload).await.unwrap();
         stream.write_all(&payload).await.unwrap();
         String::from_utf8(received).unwrap()
+    }
+
+    /// A gateway URL with an IPv6 literal (`ws://[::1]:port`) has to be dialed without the brackets.
+    #[tokio::test]
+    async fn connects_to_an_ipv6_literal_gateway_directly() {
+        let Ok(listener) = TcpListener::bind("[::1]:0").await else {
+            return; // no IPv6 loopback on this host
+        };
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.is_ok() });
+        let request = build_gateway_request(&format!("ws://[::1]:{port}/"), None, &[]).unwrap();
+
+        // The peer is not a websocket server, so the handshake fails; what matters is that the
+        // TCP connection was made at all.
+        let _ = connect_websocket(request, false, false, None).await;
+
+        let accepted = timeout(Duration::from_secs(2), accept).await;
+        assert!(
+            matches!(accepted, Ok(Ok(true))),
+            "no connection reached [::1]:{port}"
+        );
     }
 
     #[tokio::test]

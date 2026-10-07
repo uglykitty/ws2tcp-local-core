@@ -52,6 +52,10 @@ pub struct Settings {
     pub rule_refresh_interval: Duration,
     pub proxy_mode: ProxyMode,
     pub insecure: bool,
+    /// Open gateway tunnels over HTTP/3 (WebSocket over QUIC, RFC 9220), falling back to
+    /// HTTP/1.1 over TCP when the gateway or the network does not allow it. Only for `wss`
+    /// gateways, and not together with an upstream proxy (QUIC cannot pass through one).
+    pub http3: bool,
     pub auth_mode: AuthMode,
     /// A proxy server (`http://`, `socks5h://` or `socks5://`) that all outgoing connections are
     /// made through: to the gateway, direct requests, and the downloads of the rule lists.
@@ -98,6 +102,7 @@ struct FileSettings {
     rule_refresh_interval_secs: Option<u64>,
     proxy_mode: Option<ProxyMode>,
     insecure: Option<bool>,
+    http3: Option<bool>,
     auth_mode: Option<AuthMode>,
     upstream_proxy: Option<String>,
 }
@@ -115,6 +120,7 @@ pub struct SettingsOverrides {
     pub rule_refresh_interval_secs: Option<u64>,
     pub proxy_mode: Option<ProxyMode>,
     pub insecure: bool,
+    pub http3: bool,
     pub auth_mode: Option<AuthMode>,
     /// A blank value means no upstream proxy, and overrides one from the file.
     pub upstream_proxy: Option<String>,
@@ -176,6 +182,7 @@ impl Settings {
             } else {
                 file_settings.insecure.unwrap_or(false)
             },
+            http3: overrides.http3 || file_settings.http3.unwrap_or(false),
             auth_mode: overrides
                 .auth_mode
                 .or(file_settings.auth_mode)
@@ -226,6 +233,7 @@ mod tests {
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
+            http3: false,
             auth_mode: None,
             upstream_proxy: None,
         }
@@ -243,6 +251,7 @@ mod tests {
             rule_refresh_interval: Duration::from_secs(DEFAULT_RULE_REFRESH_INTERVAL_SECS),
             proxy_mode: ProxyMode::Global,
             insecure: false,
+            http3: false,
             auth_mode: AuthMode::Basic,
             upstream_proxy: None,
             headers: Vec::new(),
@@ -292,6 +301,7 @@ mod tests {
             rule_refresh_interval_secs: Some(30),
             proxy_mode: Some(ProxyMode::Global),
             insecure: true,
+            http3: false,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -346,6 +356,7 @@ insecure = true
             rule_refresh_interval_secs: Some(30),
             proxy_mode: Some(ProxyMode::Global),
             insecure: false,
+            http3: false,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -384,6 +395,7 @@ custom_domain_rules = "custom-domains.txt"
 rule_refresh_interval_secs = 45
 proxy_mode = "global"
 insecure = true
+http3 = true
 "#,
         )
         .unwrap();
@@ -391,6 +403,7 @@ insecure = true
         let settings = Settings::resolve(overrides_with_config(Some(config_path.clone()))).unwrap();
         let _ = fs::remove_file(&config_path);
 
+        assert!(settings.http3);
         assert_eq!(settings.listen, "127.0.0.1:7000".parse().unwrap());
         assert_eq!(settings.gateway, "wss://file.example/ws");
         assert_eq!(settings.basic_auth, None);
@@ -419,6 +432,7 @@ insecure = true
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
+            http3: false,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -441,6 +455,7 @@ insecure = true
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
+            http3: false,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -463,6 +478,7 @@ insecure = true
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
+            http3: false,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -485,6 +501,7 @@ insecure = true
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
+            http3: false,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -511,6 +528,7 @@ insecure = true
                 rule_refresh_interval_secs: Some(0),
                 proxy_mode: None,
                 insecure: false,
+                http3: false,
                 auth_mode: None,
                 upstream_proxy: None,
             })

@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Gateway tunnels can run over HTTP/3** (`Settings::http3`, `http3 = true` in the config
+  file): WebSocket over QUIC per RFC 9220, an extended CONNECT request on a QUIC stream. All
+  tunnels share one QUIC connection to the gateway. When HTTP/3 cannot be used (UDP is blocked,
+  the gateway does not support RFC 9220) tunnels fall back to HTTP/1.1 over TCP, and stay on
+  it for 60 seconds before HTTP/3 is tried again. Only for `wss://` gateways, and ignored with an
+  upstream proxy, which cannot carry QUIC. The token endpoints (`/auth/*`) still use HTTP over
+  TCP. `examples/h3_gateway.rs` is a minimal HTTP/3 gateway for trying it out.
+- The `proxying request` and `proxying UDP request` logs now carry a `transport` field, `quic`
+  or `tcp`, telling whether that tunnel runs over HTTP/3 or HTTP/1.1. They are written once the
+  gateway tunnel is open rather than before dialing it.
+
+### Changed
+
+- The per-request logs (`proxying request`, `proxying UDP request`, `direct request`,
+  `direct UDP request`) prefix `target` with `tcp:` or `udp:`, and the proxying ones no longer
+  carry the `gateway` URL: it was the gateway logged at startup followed by that same target.
+
 ## 0.4.0 - 2026-09-22
 
 ### Added

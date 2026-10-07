@@ -1,6 +1,7 @@
 mod auth;
 mod gateway;
 mod gateway_check;
+mod http3;
 mod http_proxy;
 mod routing_rules;
 pub mod service;
