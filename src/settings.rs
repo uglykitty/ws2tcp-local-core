@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 
-use crate::upstream::UpstreamProxy;
+use crate::{http3::Mode as Http3Mode, upstream::UpstreamProxy};
 
 pub const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:3128";
@@ -106,10 +106,30 @@ struct FileSettings {
     rule_refresh_interval_secs: Option<u64>,
     proxy_mode: Option<ProxyMode>,
     insecure: Option<bool>,
-    http3: Option<bool>,
+    http3: Option<FileHttp3>,
+    /// Replaced by `http3 = "only"`; kept so that an old file is refused instead of ignored.
     http3_only: Option<bool>,
     auth_mode: Option<AuthMode>,
     upstream_proxy: Option<String>,
+}
+
+/// `http3` in a config file: `"off"`, `"on"` or `"only"`. A boolean, from before there were three
+/// modes, still works: `true` is `"on"` and `false` is `"off"`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum FileHttp3 {
+    Bool(bool),
+    Mode(Http3Mode),
+}
+
+impl From<FileHttp3> for Http3Mode {
+    fn from(value: FileHttp3) -> Self {
+        match value {
+            FileHttp3::Bool(true) => Http3Mode::Preferred,
+            FileHttp3::Bool(false) => Http3Mode::Off,
+            FileHttp3::Mode(mode) => mode,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -125,8 +145,8 @@ pub struct SettingsOverrides {
     pub rule_refresh_interval_secs: Option<u64>,
     pub proxy_mode: Option<ProxyMode>,
     pub insecure: bool,
-    pub http3: bool,
-    pub http3_only: bool,
+    /// Overrides `http3` from the file, whatever it says.
+    pub http3: Option<Http3Mode>,
     pub auth_mode: Option<AuthMode>,
     /// A blank value means no upstream proxy, and overrides one from the file.
     pub upstream_proxy: Option<String>,
@@ -166,6 +186,14 @@ impl Settings {
             bail!("--rule-refresh-interval-secs must be greater than 0");
         }
 
+        if file_settings.http3_only == Some(true) {
+            bail!("http3_only is no longer a setting; use http3 = \"only\"");
+        }
+        let http3_mode = overrides
+            .http3
+            .or(file_settings.http3.map(Http3Mode::from))
+            .unwrap_or(Http3Mode::Off);
+
         Ok(Self {
             listen,
             socks_listen: overrides.socks_listen.or(file_settings.socks_listen),
@@ -188,8 +216,8 @@ impl Settings {
             } else {
                 file_settings.insecure.unwrap_or(false)
             },
-            http3: overrides.http3 || file_settings.http3.unwrap_or(false),
-            http3_only: overrides.http3_only || file_settings.http3_only.unwrap_or(false),
+            http3: http3_mode != Http3Mode::Off,
+            http3_only: http3_mode == Http3Mode::Only,
             auth_mode: overrides
                 .auth_mode
                 .or(file_settings.auth_mode)
@@ -240,8 +268,7 @@ mod tests {
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
-            http3: false,
-            http3_only: false,
+            http3: None,
             auth_mode: None,
             upstream_proxy: None,
         }
@@ -310,8 +337,7 @@ mod tests {
             rule_refresh_interval_secs: Some(30),
             proxy_mode: Some(ProxyMode::Global),
             insecure: true,
-            http3: false,
-            http3_only: false,
+            http3: None,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -366,8 +392,7 @@ insecure = true
             rule_refresh_interval_secs: Some(30),
             proxy_mode: Some(ProxyMode::Global),
             insecure: false,
-            http3: false,
-            http3_only: false,
+            http3: None,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -444,8 +469,7 @@ http3 = true
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
-            http3: false,
-            http3_only: false,
+            http3: None,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -468,8 +492,7 @@ http3 = true
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
-            http3: false,
-            http3_only: false,
+            http3: None,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -492,8 +515,7 @@ http3 = true
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
-            http3: false,
-            http3_only: false,
+            http3: None,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -516,8 +538,7 @@ http3 = true
             rule_refresh_interval_secs: None,
             proxy_mode: None,
             insecure: false,
-            http3: false,
-            http3_only: false,
+            http3: None,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -544,8 +565,7 @@ http3 = true
                 rule_refresh_interval_secs: Some(0),
                 proxy_mode: None,
                 insecure: false,
-                http3: false,
-                http3_only: false,
+                http3: None,
                 auth_mode: None,
                 upstream_proxy: None,
             })
@@ -641,20 +661,74 @@ http3 = true
         let _ = fs::remove_file(&config_path);
     }
 
-    #[test]
-    fn http3_only_comes_from_the_flag_or_the_file() {
-        let overrides = SettingsOverrides {
+    fn http3_from(file: Option<&str>, flag: Option<Http3Mode>) -> Result<(bool, bool)> {
+        let config = file.map(|body| {
+            let path = std::env::temp_dir().join(format!(
+                "ws2tcp-local-http3-{}-{}.toml",
+                std::process::id(),
+                body.len()
+            ));
+            fs::write(&path, format!("gateway = \"wss://example.com\"\n{body}\n")).unwrap();
+            path
+        });
+        let result = Settings::resolve(SettingsOverrides {
+            config: config.clone(),
             gateway: Some("wss://example.com".to_owned()),
-            http3_only: true,
+            http3: flag,
             ..Default::default()
-        };
-        let settings = Settings::resolve(overrides).unwrap();
-        assert!(settings.http3_only);
+        });
+        if let Some(path) = config {
+            let _ = fs::remove_file(path);
+        }
+        result.map(|settings| (settings.http3, settings.http3_only))
+    }
 
-        let overrides = SettingsOverrides {
-            gateway: Some("wss://example.com".to_owned()),
-            ..Default::default()
-        };
-        assert!(!Settings::resolve(overrides).unwrap().http3_only);
+    #[test]
+    fn http3_mode_comes_from_the_flag_or_the_file() {
+        assert_eq!(http3_from(None, None).unwrap(), (false, false));
+        assert_eq!(
+            http3_from(None, Some(Http3Mode::Preferred)).unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            http3_from(None, Some(Http3Mode::Only)).unwrap(),
+            (true, true)
+        );
+        assert_eq!(
+            http3_from(Some("http3 = \"off\""), None).unwrap(),
+            (false, false)
+        );
+        assert_eq!(
+            http3_from(Some("http3 = \"on\""), None).unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            http3_from(Some("http3 = \"only\""), None).unwrap(),
+            (true, true)
+        );
+        // A boolean from before there were three modes.
+        assert_eq!(
+            http3_from(Some("http3 = true"), None).unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            http3_from(Some("http3 = false"), None).unwrap(),
+            (false, false)
+        );
+        // The flag wins over the file, even to turn HTTP/3 off.
+        assert_eq!(
+            http3_from(Some("http3 = \"only\""), Some(Http3Mode::Off)).unwrap(),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn a_bad_or_retired_http3_setting_is_an_error() {
+        assert!(http3_from(Some("http3 = \"sometimes\""), None).is_err());
+        assert!(http3_from(Some("http3_only = true"), None).is_err());
+        assert_eq!(
+            http3_from(Some("http3_only = false"), None).unwrap(),
+            (false, false)
+        );
     }
 }

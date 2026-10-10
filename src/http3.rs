@@ -68,14 +68,17 @@ impl Drop for TunnelGuard {
     }
 }
 
-/// How tunnels to the gateway use HTTP/3.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How tunnels to the gateway use HTTP/3. In a config file it is `"off"`, `"on"` or `"only"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 pub enum Mode {
     /// TCP only.
+    #[serde(rename = "off")]
     Off,
     /// HTTP/3 first, HTTP/1.1 over TCP when that fails.
+    #[serde(rename = "on")]
     Preferred,
     /// HTTP/3 only: when it fails, the tunnel fails, with no TCP fallback.
+    #[serde(rename = "only")]
     Only,
 }
 

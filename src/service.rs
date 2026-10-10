@@ -268,7 +268,7 @@ mod tests {
     async fn run_with(gateway: &str, upstream_proxy: Option<&str>) -> Result<()> {
         let settings = Settings::resolve(SettingsOverrides {
             gateway: Some(gateway.to_owned()),
-            http3_only: true,
+            http3: Some(Http3Mode::Only),
             upstream_proxy: upstream_proxy.map(str::to_owned),
             ..Default::default()
         })?;
