@@ -406,10 +406,7 @@ mod tests {
     #[test]
     fn builds_udp_associate_reply_for_ipv4() {
         let reply = udp_associate_reply("127.0.0.1:40000".parse().unwrap());
-        assert_eq!(
-            reply,
-            [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x9c, 0x40]
-        );
+        assert_eq!(reply, [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x9c, 0x40]);
     }
 
     #[test]
