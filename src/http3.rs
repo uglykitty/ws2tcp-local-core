@@ -68,18 +68,40 @@ impl Drop for TunnelGuard {
     }
 }
 
-/// How tunnels to the gateway use HTTP/3. In a config file it is `"off"`, `"on"` or `"only"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+/// How tunnels to the gateway use HTTP/3. In a config file it is `"off"`, `"on"` or `"only"`;
+/// `true` and `false` also work, as `"on"` and `"off"`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// TCP only.
-    #[serde(rename = "off")]
+    #[default]
     Off,
     /// HTTP/3 first, HTTP/1.1 over TCP when that fails.
-    #[serde(rename = "on")]
     Preferred,
     /// HTTP/3 only: when it fails, the tunnel fails, with no TCP fallback.
-    #[serde(rename = "only")]
     Only,
+}
+
+impl<'de> serde::Deserialize<'de> for Mode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Name(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Bool(true) => Ok(Mode::Preferred),
+            Raw::Bool(false) => Ok(Mode::Off),
+            Raw::Name(name) => match name.as_str() {
+                "off" => Ok(Mode::Off),
+                "on" => Ok(Mode::Preferred),
+                "only" => Ok(Mode::Only),
+                _ => Err(serde::de::Error::custom(format!(
+                    "http3 must be \"off\", \"on\" or \"only\", not {name:?}"
+                ))),
+            },
+        }
+    }
 }
 
 /// The HTTP/3 mode of the running proxy, which can be changed while it runs.

@@ -49,22 +49,22 @@ pub async fn run_proxy_with_updates(
     if let Some(upstream_proxy) = &upstream_proxy {
         info!(upstream_proxy = %upstream_proxy, "all outgoing connections go through an upstream proxy");
     }
-    let http3 = if settings.http3_only {
-        // Nothing to fall back to: an unusable setup is an error, not a warning.
-        if let Some(reason) = http3_unusable(&gateway, upstream_proxy.is_some()) {
-            return Err(anyhow!("--http3-only cannot be used: {reason}"));
-        }
-        Http3Mode::Only
-    } else if settings.http3 {
-        match http3_unusable(&gateway, upstream_proxy.is_some()) {
+    let http3 = match settings.http3 {
+        Http3Mode::Off => Http3Mode::Off,
+        Http3Mode::Preferred => match http3_unusable(&gateway, upstream_proxy.is_some()) {
             Some(reason) => {
                 warn!("HTTP/3 is ignored because {reason}");
                 Http3Mode::Off
             }
             None => Http3Mode::Preferred,
+        },
+        Http3Mode::Only => {
+            // Nothing to fall back to: an unusable setup is an error, not a warning.
+            if let Some(reason) = http3_unusable(&gateway, upstream_proxy.is_some()) {
+                return Err(anyhow!("HTTP/3 only cannot be used: {reason}"));
+            }
+            Http3Mode::Only
         }
-    } else {
-        Http3Mode::Off
     };
     let auth = match (settings.auth_mode, remote_basic_auth(settings.basic_auth)?) {
         // Authentication is not enabled: there is nothing to log in with, or to check credentials
@@ -228,16 +228,17 @@ where
     Box::pin(shutdown)
 }
 
-/// The HTTP/3 mode that `settings` start the proxy with.
+/// The HTTP/3 mode that `settings` start the proxy with: `Preferred` becomes `Off` where HTTP/3
+/// cannot be used. `Only` stays, and the proxy refuses to start with it.
 pub fn http3_mode(settings: &Settings) -> Http3Mode {
-    if settings.http3_only {
-        Http3Mode::Only
-    } else if settings.http3
-        && http3_unusable_for(&settings.gateway, settings.upstream_proxy.is_some()).is_none()
-    {
+    match settings.http3 {
         Http3Mode::Preferred
-    } else {
-        Http3Mode::Off
+            if http3_unusable_for(&settings.gateway, settings.upstream_proxy.is_some())
+                .is_some() =>
+        {
+            Http3Mode::Off
+        }
+        mode => mode,
     }
 }
 
@@ -278,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn http3_only_is_refused_where_http3_cannot_work() {
         let err = run_with("ws://127.0.0.1:1", None).await.unwrap_err();
-        assert!(format!("{err:#}").contains("--http3-only"), "{err:#}");
+        assert!(format!("{err:#}").contains("HTTP/3 only"), "{err:#}");
         assert!(format!("{err:#}").contains("wss://"), "{err:#}");
 
         let err = run_with("wss://example.com", Some("socks5h://127.0.0.1:1"))
