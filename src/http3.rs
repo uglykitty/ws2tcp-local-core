@@ -59,6 +59,14 @@ static SESSIONS: LazyLock<AsyncMutex<HashMap<SessionKey, Session>>> =
     LazyLock::new(Default::default);
 static FALLBACK_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// Forgets the cached HTTP/3 connection (and any TCP fallback period), so the next tunnel
+/// resolves the gateway again and dials a fresh QUIC connection. Tunnels already running keep
+/// their streams, and the old connection closes by itself once they are done.
+pub async fn reset_sessions() {
+    SESSIONS.lock().await.clear();
+    *FALLBACK_UNTIL.lock().unwrap() = None;
+}
+
 fn io_error(err: impl std::fmt::Display) -> WsError {
     WsError::Io(io::Error::other(err.to_string()))
 }
