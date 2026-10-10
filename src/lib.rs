@@ -13,7 +13,7 @@ mod tunnel;
 mod upstream;
 
 pub use gateway_check::GatewayCheckError;
-pub use http3::reset_sessions;
+pub use http3::{Http3ConnInfo, Http3Snapshot, reset_sessions, snapshot as http3_snapshot};
 pub use service::{run_proxy, run_proxy_with_mode_updates};
 pub use settings::{
     AuthMode, DEFAULT_BUFFER_SIZE, DEFAULT_LISTEN, DEFAULT_RULE_REFRESH_INTERVAL_SECS, ProxyMode,

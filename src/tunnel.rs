@@ -34,7 +34,7 @@ use tracing::{debug, info};
 use crate::{
     gateway::Gateway,
     http_proxy::read_proxy_request,
-    http3,
+    http3::{self, Mode as Http3Mode},
     routing_rules::{RoutingRules, host_from_authority, split_authority},
     session::GatewayAuth,
     socks5::{self, Socks5Command, read_socks5_request},
@@ -57,7 +57,7 @@ pub(crate) struct Config {
     pub(crate) buffer_size: usize,
     pub(crate) routing_rules: RoutingRules,
     pub(crate) insecure: bool,
-    pub(crate) http3: bool,
+    pub(crate) http3: Http3Mode,
     pub(crate) upstream_proxy: Option<Arc<UpstreamProxy>>,
     pub(crate) headers: Vec<(HeaderName, HeaderValue)>,
 }
@@ -426,17 +426,17 @@ impl AsyncWrite for GatewayStream {
 /// proxy sees only the gateway's address.
 ///
 /// With `http3`, a `wss` gateway is tried over HTTP/3 first (QUIC cannot go through an upstream
-/// proxy, so there it is skipped) and TCP is the fallback.
+/// proxy, so there it is skipped) and TCP is the fallback, unless HTTP/3 is the only transport.
 pub(crate) async fn connect_websocket(
     request: Request,
     insecure: bool,
-    http3: bool,
+    http3: Http3Mode,
     upstream_proxy: Option<&UpstreamProxy>,
 ) -> Result<GatewayWebSocket, WsError> {
-    if http3
+    if http3 != Http3Mode::Off
         && upstream_proxy.is_none()
         && request.uri().scheme_str() == Some("wss")
-        && let Some(stream) = http3::connect(&request, insecure).await?
+        && let Some(stream) = http3::connect(&request, insecure, http3 == Http3Mode::Only).await?
     {
         // The QUIC connection is already TLS-protected, and the handshake is done.
         let stream = MaybeTlsStream::Plain(GatewayStream::Http3(stream));
@@ -880,7 +880,7 @@ mod tests {
 
         // The peer is not a websocket server, so the handshake fails; what matters is that the
         // TCP connection was made at all.
-        let _ = connect_websocket(request, false, false, None).await;
+        let _ = connect_websocket(request, false, Http3Mode::Off, None).await;
 
         let accepted = timeout(Duration::from_secs(2), accept).await;
         assert!(

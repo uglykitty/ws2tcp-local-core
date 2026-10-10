@@ -56,6 +56,10 @@ pub struct Settings {
     /// HTTP/1.1 over TCP when the gateway or the network does not allow it. Only for `wss`
     /// gateways, and not together with an upstream proxy (QUIC cannot pass through one).
     pub http3: bool,
+    /// Like `http3`, but with no HTTP/1.1 fallback: when HTTP/3 does not work, tunnels fail.
+    /// The gateway must be a `wss` URL, and no upstream proxy may be set; both are refused at
+    /// startup. Implies `http3`.
+    pub http3_only: bool,
     pub auth_mode: AuthMode,
     /// A proxy server (`http://`, `socks5h://` or `socks5://`) that all outgoing connections are
     /// made through: to the gateway, direct requests, and the downloads of the rule lists.
@@ -103,6 +107,7 @@ struct FileSettings {
     proxy_mode: Option<ProxyMode>,
     insecure: Option<bool>,
     http3: Option<bool>,
+    http3_only: Option<bool>,
     auth_mode: Option<AuthMode>,
     upstream_proxy: Option<String>,
 }
@@ -121,6 +126,7 @@ pub struct SettingsOverrides {
     pub proxy_mode: Option<ProxyMode>,
     pub insecure: bool,
     pub http3: bool,
+    pub http3_only: bool,
     pub auth_mode: Option<AuthMode>,
     /// A blank value means no upstream proxy, and overrides one from the file.
     pub upstream_proxy: Option<String>,
@@ -183,6 +189,7 @@ impl Settings {
                 file_settings.insecure.unwrap_or(false)
             },
             http3: overrides.http3 || file_settings.http3.unwrap_or(false),
+            http3_only: overrides.http3_only || file_settings.http3_only.unwrap_or(false),
             auth_mode: overrides
                 .auth_mode
                 .or(file_settings.auth_mode)
@@ -234,6 +241,7 @@ mod tests {
             proxy_mode: None,
             insecure: false,
             http3: false,
+            http3_only: false,
             auth_mode: None,
             upstream_proxy: None,
         }
@@ -252,6 +260,7 @@ mod tests {
             proxy_mode: ProxyMode::Global,
             insecure: false,
             http3: false,
+            http3_only: false,
             auth_mode: AuthMode::Basic,
             upstream_proxy: None,
             headers: Vec::new(),
@@ -302,6 +311,7 @@ mod tests {
             proxy_mode: Some(ProxyMode::Global),
             insecure: true,
             http3: false,
+            http3_only: false,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -357,6 +367,7 @@ insecure = true
             proxy_mode: Some(ProxyMode::Global),
             insecure: false,
             http3: false,
+            http3_only: false,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -404,6 +415,7 @@ http3 = true
         let _ = fs::remove_file(&config_path);
 
         assert!(settings.http3);
+        assert!(!settings.http3_only);
         assert_eq!(settings.listen, "127.0.0.1:7000".parse().unwrap());
         assert_eq!(settings.gateway, "wss://file.example/ws");
         assert_eq!(settings.basic_auth, None);
@@ -433,6 +445,7 @@ http3 = true
             proxy_mode: None,
             insecure: false,
             http3: false,
+            http3_only: false,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -456,6 +469,7 @@ http3 = true
             proxy_mode: None,
             insecure: false,
             http3: false,
+            http3_only: false,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -479,6 +493,7 @@ http3 = true
             proxy_mode: None,
             insecure: false,
             http3: false,
+            http3_only: false,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -502,6 +517,7 @@ http3 = true
             proxy_mode: None,
             insecure: false,
             http3: false,
+            http3_only: false,
             auth_mode: None,
             upstream_proxy: None,
         })
@@ -529,6 +545,7 @@ http3 = true
                 proxy_mode: None,
                 insecure: false,
                 http3: false,
+                http3_only: false,
                 auth_mode: None,
                 upstream_proxy: None,
             })
@@ -622,5 +639,22 @@ http3 = true
         // A blank value on the command line turns the proxy from the file off.
         assert_eq!(resolve(Some(config_path.clone()), Some("")).unwrap(), None);
         let _ = fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn http3_only_comes_from_the_flag_or_the_file() {
+        let overrides = SettingsOverrides {
+            gateway: Some("wss://example.com".to_owned()),
+            http3_only: true,
+            ..Default::default()
+        };
+        let settings = Settings::resolve(overrides).unwrap();
+        assert!(settings.http3_only);
+
+        let overrides = SettingsOverrides {
+            gateway: Some("wss://example.com".to_owned()),
+            ..Default::default()
+        };
+        assert!(!Settings::resolve(overrides).unwrap().http3_only);
     }
 }

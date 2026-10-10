@@ -9,6 +9,7 @@ use tokio_tungstenite::tungstenite::{
 
 use crate::{
     gateway::Gateway,
+    http3::Mode as Http3Mode,
     tunnel::{build_gateway_request, connect_websocket},
     upstream::UpstreamProxy,
 };
@@ -69,7 +70,7 @@ pub(crate) async fn check_gateway(
     gateway: &Gateway,
     basic_auth: Option<&str>,
     insecure: bool,
-    http3: bool,
+    http3: Http3Mode,
     upstream_proxy: Option<&UpstreamProxy>,
     headers: &[(HeaderName, HeaderValue)],
 ) -> Result<(), GatewayCheckError> {
@@ -217,7 +218,7 @@ mod tests {
     async fn passes_with_correct_credentials() {
         let gateway = spawn_gateway(FakeGateway::Router).await;
 
-        check_gateway(&gateway, Some(ALICE), false, false, None, &[])
+        check_gateway(&gateway, Some(ALICE), false, Http3Mode::Off, None, &[])
             .await
             .expect("health check should pass");
     }
@@ -308,7 +309,7 @@ mod tests {
                 &gateway,
                 Some(ALICE),
                 false,
-                false,
+                Http3Mode::Off,
                 Some(&upstream_proxy),
                 &[],
             )
@@ -327,9 +328,16 @@ mod tests {
         let upstream_proxy = UpstreamProxy::parse(&format!("socks5h://u:secret@{addr}")).unwrap();
         let gateway = Gateway::parse("ws://gateway.invalid:8000").unwrap();
 
-        let err = check_gateway(&gateway, None, false, false, Some(&upstream_proxy), &[])
-            .await
-            .unwrap_err();
+        let err = check_gateway(
+            &gateway,
+            None,
+            false,
+            Http3Mode::Off,
+            Some(&upstream_proxy),
+            &[],
+        )
+        .await
+        .unwrap_err();
         let message = err.to_string();
         assert!(matches!(err, GatewayCheckError::Failed(_)), "{message}");
         assert!(message.contains(&format!("socks5h://{addr}")), "{message}");
@@ -344,7 +352,7 @@ mod tests {
             &gateway,
             Some("Basic YWxpY2U6d3Jvbmc="),
             false,
-            false,
+            Http3Mode::Off,
             None,
             &[],
         )
@@ -369,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn reports_missing_credentials() {
         let gateway = spawn_gateway(FakeGateway::Router).await;
-        let err = check_gateway(&gateway, None, false, false, None, &[])
+        let err = check_gateway(&gateway, None, false, Http3Mode::Off, None, &[])
             .await
             .unwrap_err();
 
@@ -388,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn fails_on_unexpected_reply() {
         let gateway = spawn_gateway(FakeGateway::WrongReply).await;
-        let err = check_gateway(&gateway, None, false, false, None, &[])
+        let err = check_gateway(&gateway, None, false, Http3Mode::Off, None, &[])
             .await
             .unwrap_err();
 
@@ -398,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn fails_when_gateway_hangs_up() {
         let gateway = spawn_gateway(FakeGateway::Hangup).await;
-        let err = check_gateway(&gateway, None, false, false, None, &[])
+        let err = check_gateway(&gateway, None, false, Http3Mode::Off, None, &[])
             .await
             .unwrap_err();
 
@@ -419,7 +427,7 @@ mod tests {
             .unwrap();
         let gateway = Gateway::parse(&format!("ws://{addr}")).unwrap();
 
-        let err = check_gateway(&gateway, None, false, false, None, &[])
+        let err = check_gateway(&gateway, None, false, Http3Mode::Off, None, &[])
             .await
             .unwrap_err();
         assert!(matches!(err, GatewayCheckError::Failed(_)), "{err}");

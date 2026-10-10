@@ -9,6 +9,7 @@ use crate::{
     auth::remote_basic_auth,
     gateway::Gateway,
     gateway_check::check_gateway,
+    http3::Mode as Http3Mode,
     routing_rules::RoutingRules,
     session::GatewayAuth,
     settings::{AuthMode, Settings},
@@ -35,7 +36,23 @@ pub async fn run_proxy_with_mode_updates(
     if let Some(upstream_proxy) = &upstream_proxy {
         info!(upstream_proxy = %upstream_proxy, "all outgoing connections go through an upstream proxy");
     }
-    let http3 = settings.http3 && http3_usable(&gateway, upstream_proxy.is_some());
+    let http3 = if settings.http3_only {
+        // Nothing to fall back to: an unusable setup is an error, not a warning.
+        if let Some(reason) = http3_unusable(&gateway, upstream_proxy.is_some()) {
+            return Err(anyhow!("--http3-only cannot be used: {reason}"));
+        }
+        Http3Mode::Only
+    } else if settings.http3 {
+        match http3_unusable(&gateway, upstream_proxy.is_some()) {
+            Some(reason) => {
+                warn!("HTTP/3 is ignored because {reason}");
+                Http3Mode::Off
+            }
+            None => Http3Mode::Preferred,
+        }
+    } else {
+        Http3Mode::Off
+    };
     let auth = match (settings.auth_mode, remote_basic_auth(settings.basic_auth)?) {
         // Authentication is not enabled: there is nothing to log in with, or to check credentials
         // against, so nothing is sent at startup.
@@ -120,7 +137,7 @@ pub async fn run_proxy_with_mode_updates(
         socks_listen = %socks_listen_addr.map(|addr| addr.to_string()).unwrap_or_else(|| "disabled".to_owned()),
         gateway = %config.gateway.base(),
         insecure = config.insecure,
-        http3 = config.http3,
+        http3 = ?config.http3,
         rule_refresh_interval_secs = settings.rule_refresh_interval.as_secs(),
         routing_rules = %config.routing_rules,
         routing_rules_detail = %config.routing_rules.describe(),
@@ -183,18 +200,42 @@ where
     Box::pin(shutdown)
 }
 
-/// Whether `--http3` can apply, warning when it cannot: QUIC needs a `wss` gateway and a direct
-/// path to it.
-fn http3_usable(gateway: &Gateway, has_upstream_proxy: bool) -> bool {
+/// Why `--http3` cannot apply, if it cannot: QUIC needs a `wss` gateway and a direct path to it.
+fn http3_unusable(gateway: &Gateway, has_upstream_proxy: bool) -> Option<&'static str> {
     if !gateway.base().starts_with("wss://") {
-        warn!("HTTP/3 is ignored because the gateway is not a wss:// URL");
-        false
+        Some("the gateway is not a wss:// URL")
     } else if has_upstream_proxy {
-        warn!(
-            "HTTP/3 is ignored because an upstream proxy is configured; QUIC cannot pass through one"
-        );
-        false
+        Some("an upstream proxy is configured, and QUIC cannot pass through one")
     } else {
-        true
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::SettingsOverrides;
+
+    use super::*;
+
+    async fn run_with(gateway: &str, upstream_proxy: Option<&str>) -> Result<()> {
+        let settings = Settings::resolve(SettingsOverrides {
+            gateway: Some(gateway.to_owned()),
+            http3_only: true,
+            upstream_proxy: upstream_proxy.map(str::to_owned),
+            ..Default::default()
+        })?;
+        run_proxy(settings, std::future::pending()).await
+    }
+
+    #[tokio::test]
+    async fn http3_only_is_refused_where_http3_cannot_work() {
+        let err = run_with("ws://127.0.0.1:1", None).await.unwrap_err();
+        assert!(format!("{err:#}").contains("--http3-only"), "{err:#}");
+        assert!(format!("{err:#}").contains("wss://"), "{err:#}");
+
+        let err = run_with("wss://example.com", Some("socks5h://127.0.0.1:1"))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("upstream proxy"), "{err:#}");
     }
 }

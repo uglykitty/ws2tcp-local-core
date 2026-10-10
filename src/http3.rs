@@ -12,12 +12,16 @@ use std::{
     collections::HashMap,
     io,
     net::SocketAddr,
-    sync::{LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use bytes::{Buf, Bytes};
 use hpx_h3::{client::SendRequest, ext::Protocol, quinn as h3_quinn};
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex},
     net::lookup_host,
@@ -50,7 +54,98 @@ struct Session {
     requests: Requests,
     connection: quinn::Connection,
     // Keeps the UDP socket alive for as long as the session is cached.
-    _endpoint: quinn::Endpoint,
+    endpoint: quinn::Endpoint,
+    // Tunnels currently open on this connection.
+    tunnels: Arc<AtomicUsize>,
+}
+
+/// Decrements the tunnel count of a session when a tunnel's pump task ends.
+struct TunnelGuard(Arc<AtomicUsize>);
+
+impl Drop for TunnelGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// How tunnels to the gateway use HTTP/3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// TCP only.
+    Off,
+    /// HTTP/3 first, HTTP/1.1 over TCP when that fails.
+    Preferred,
+    /// HTTP/3 only: when it fails, the tunnel fails, with no TCP fallback.
+    Only,
+}
+
+/// One cached QUIC connection to the gateway, as [`snapshot`] reports it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Http3ConnInfo {
+    pub host: String,
+    pub port: u16,
+    pub local_addr: Option<String>,
+    pub remote_addr: String,
+    /// `established`, or `closed` for a connection that is about to be dropped from the cache.
+    pub state: String,
+    pub rtt_ms: u64,
+    pub cwnd: u64,
+    pub lost_packets: u64,
+    pub udp_tx_bytes: u64,
+    pub udp_rx_bytes: u64,
+    pub active_tunnels: usize,
+}
+
+/// The HTTP/3 state of the proxy: the cached QUIC connections, and whether tunnels currently
+/// skip HTTP/3 after a failure.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Http3Snapshot {
+    pub connections: Vec<Http3ConnInfo>,
+    /// Seconds left of the period in which tunnels go straight to TCP, if one is running.
+    pub tcp_fallback_secs_left: Option<u64>,
+}
+
+/// A snapshot of the cached HTTP/3 connections, for display (a `netstat` for QUIC: the UDP
+/// socket alone says nothing, as every tunnel shares one connection).
+pub async fn snapshot() -> Http3Snapshot {
+    let mut connections: Vec<Http3ConnInfo> = SESSIONS
+        .lock()
+        .await
+        .iter()
+        .map(|((host, port, _), session)| {
+            let stats = session.connection.stats();
+            Http3ConnInfo {
+                host: host.clone(),
+                port: *port,
+                local_addr: session
+                    .endpoint
+                    .local_addr()
+                    .ok()
+                    .map(|addr| addr.to_string()),
+                remote_addr: session.connection.remote_address().to_string(),
+                state: if session.connection.close_reason().is_none() {
+                    "established"
+                } else {
+                    "closed"
+                }
+                .to_owned(),
+                rtt_ms: u64::try_from(stats.path.rtt.as_millis()).unwrap_or(u64::MAX),
+                cwnd: stats.path.cwnd,
+                lost_packets: stats.path.lost_packets,
+                udp_tx_bytes: stats.udp_tx.bytes,
+                udp_rx_bytes: stats.udp_rx.bytes,
+                active_tunnels: session.tunnels.load(Ordering::Relaxed),
+            }
+        })
+        .collect();
+    connections.sort_by(|a, b| (&a.host, a.port).cmp(&(&b.host, b.port)));
+    let tcp_fallback_secs_left = (*FALLBACK_UNTIL.lock().unwrap())
+        .and_then(|until| until.checked_duration_since(Instant::now()))
+        .map(|left| left.as_secs() + 1);
+    Http3Snapshot {
+        connections,
+        tcp_fallback_secs_left,
+    }
 }
 
 type SessionKey = (String, u16, bool);
@@ -88,11 +183,15 @@ fn fallback_active() -> bool {
 /// the caller should connect over TCP. The one error returned is the gateway refusing the
 /// credentials (401), which a TCP connection would only repeat, and which the caller handles by
 /// renewing its token.
+///
+/// With `only`, there is no fallback: a failure is an error, and no TCP period begins, so the
+/// next tunnel tries HTTP/3 again.
 pub(crate) async fn connect(
     request: &Request,
     insecure: bool,
+    only: bool,
 ) -> Result<Option<DuplexStream>, WsError> {
-    if fallback_active() {
+    if !only && fallback_active() {
         return Ok(None);
     }
     match try_connect(request, insecure).await {
@@ -100,6 +199,7 @@ pub(crate) async fn connect(
         Err(WsError::Http(response)) if response.status() == StatusCode::UNAUTHORIZED => {
             Err(WsError::Http(response))
         }
+        Err(err) if only => Err(err),
         Err(err) => {
             warn!(
                 error = %err,
@@ -122,8 +222,8 @@ async fn try_connect(request: &Request, insecure: bool) -> Result<DuplexStream, 
 
     // A cached connection may have been closed by the gateway since it was last used; the
     // request is then repeated once on a new connection.
-    let (mut requests, cached) = session(&key).await?;
-    let result = open_stream_in_time(&mut requests, request).await;
+    let (mut requests, tunnels, cached) = session(&key).await?;
+    let result = open_stream_in_time(&mut requests, &tunnels, request).await;
     if !cached || !matches!(&result, Err(err) if !matches!(err, WsError::Http(_))) {
         return result;
     }
@@ -131,8 +231,8 @@ async fn try_connect(request: &Request, insecure: bool) -> Result<DuplexStream, 
         debug!(error = %err, "HTTP/3 request on a cached connection failed; reconnecting");
     }
     SESSIONS.lock().await.remove(&key);
-    let (mut requests, _) = session(&key).await?;
-    let result = open_stream_in_time(&mut requests, request).await;
+    let (mut requests, tunnels, _) = session(&key).await?;
+    let result = open_stream_in_time(&mut requests, &tunnels, request).await;
     if matches!(&result, Err(err) if !matches!(err, WsError::Http(_))) {
         SESSIONS.lock().await.remove(&key);
     }
@@ -141,28 +241,30 @@ async fn try_connect(request: &Request, insecure: bool) -> Result<DuplexStream, 
 
 async fn open_stream_in_time(
     requests: &mut Requests,
+    tunnels: &Arc<AtomicUsize>,
     request: &Request,
 ) -> Result<DuplexStream, WsError> {
-    match timeout(REQUEST_TIMEOUT, open_stream(requests, request)).await {
+    match timeout(REQUEST_TIMEOUT, open_stream(requests, tunnels, request)).await {
         Ok(result) => result,
         Err(_) => Err(io_error("the gateway did not answer the websocket request")),
     }
 }
 
-/// The cached HTTP/3 connection to the gateway (established first if there is none), and whether
-/// it was already cached.
-async fn session(key: &SessionKey) -> Result<(Requests, bool), WsError> {
+/// The cached HTTP/3 connection to the gateway (established first if there is none), its tunnel
+/// count, and whether it was already cached.
+async fn session(key: &SessionKey) -> Result<(Requests, Arc<AtomicUsize>, bool), WsError> {
     let mut sessions = SESSIONS.lock().await;
     if let Some(session) = sessions.get(key) {
         if session.connection.close_reason().is_none() {
-            return Ok((session.requests.clone(), true));
+            return Ok((session.requests.clone(), session.tunnels.clone(), true));
         }
         sessions.remove(key);
     }
     let session = establish(&key.0, key.1, key.2).await?;
     let requests = session.requests.clone();
+    let tunnels = session.tunnels.clone();
     sessions.insert(key.clone(), session);
-    Ok((requests, false))
+    Ok((requests, tunnels, false))
 }
 
 async fn establish(host: &str, port: u16, insecure: bool) -> Result<Session, WsError> {
@@ -210,13 +312,18 @@ async fn connect_quic(addr: SocketAddr, host: &str, insecure: bool) -> Result<Se
     Ok(Session {
         requests,
         connection,
-        _endpoint: endpoint,
+        endpoint,
+        tunnels: Arc::default(),
     })
 }
 
 /// Sends the extended CONNECT request for one tunnel and, once the gateway accepts it, turns the
 /// request stream into a byte stream for the websocket frames.
-async fn open_stream(requests: &mut Requests, request: &Request) -> Result<DuplexStream, WsError> {
+async fn open_stream(
+    requests: &mut Requests,
+    tunnels: &Arc<AtomicUsize>,
+    request: &Request,
+) -> Result<DuplexStream, WsError> {
     let uri = request.uri();
     let authority = uri
         .authority()
@@ -272,7 +379,10 @@ async fn open_stream(requests: &mut Requests, request: &Request) -> Result<Duple
         }
         let _ = to_websocket.shutdown().await;
     });
+    tunnels.fetch_add(1, Ordering::Relaxed);
+    let guard = TunnelGuard(tunnels.clone());
     tokio::spawn(async move {
+        let _guard = guard;
         let mut buffer = vec![0_u8; PUMP_BUFFER];
         loop {
             match from_websocket.read(&mut buffer).await {
