@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1 - 2026-10-10
+
+### Added
+
+- **`reset_sessions()` drops the cached HTTP/3 connection to the gateway.** All tunnels share
+  one QUIC connection, so the gateway is only resolved again once that connection closes. After
+  `reset_sessions()` (which also ends the TCP fallback period) the next tunnel resolves the
+  gateway and dials a new QUIC connection. Tunnels that are already running keep their streams.
+
 ## 0.5.0 - 2026-10-08
 
 ### Added
