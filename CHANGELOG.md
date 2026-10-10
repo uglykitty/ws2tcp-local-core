@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0 - 2026-10-10
+
+### Changed
+
+- **`http3` in a config file is `"off"`, `"on"` or `"only"`.** `true` and `false` still work, as
+  `"on"` and `"off"`. `http3_only = true` is refused with an error that points to `http3 =
+  "only"`; `http3_only = false` is still accepted.
+- **`SettingsOverrides::http3` is an `Option<Http3Mode>`, and `SettingsOverrides::http3_only` is
+  gone.** `Some(Http3Mode::Off)` now overrides an `http3` from the file, which the former `bool`
+  could not. `Settings` itself is unchanged: `http3` and `http3_only` are still its fields.
+- `Http3Mode` can be deserialized (`"off"`, `"on"`, `"only"`).
+
 ## 0.7.0 - 2026-10-10
 
 ### Added
