@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.0 - 2026-10-10
+
+### Added
+
+- **`Settings::http3_only`** (`http3_only` in the config file, `SettingsOverrides::http3_only`)
+  opens tunnels over HTTP/3 only: when it fails, the tunnel fails, with no HTTP/1.1 fallback and
+  no TCP period. `run_proxy` refuses to start with it when the gateway is not a `wss://` URL or
+  an upstream proxy is set. It implies `http3`.
+- **`http3_snapshot()`** returns an `Http3Snapshot` of the cached QUIC connections (addresses,
+  state, RTT, congestion window, lost packets, UDP bytes, open tunnels) and the remaining TCP
+  fallback period, for display. `Http3Snapshot` and `Http3ConnInfo` are serializable.
+
+### Changed
+
+- `Settings` has a new public field, `http3_only`; code that builds it by hand must set it.
+
 ## 0.5.1 - 2026-10-10
 
 ### Added
