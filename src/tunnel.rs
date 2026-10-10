@@ -57,7 +57,7 @@ pub(crate) struct Config {
     pub(crate) buffer_size: usize,
     pub(crate) routing_rules: RoutingRules,
     pub(crate) insecure: bool,
-    pub(crate) http3: Http3Mode,
+    pub(crate) http3: http3::Switch,
     pub(crate) upstream_proxy: Option<Arc<UpstreamProxy>>,
     pub(crate) headers: Vec<(HeaderName, HeaderValue)>,
 }
@@ -479,7 +479,7 @@ async fn connect_gateway(config: &Config, ws_url: &str) -> Result<GatewayWebSock
         match connect_websocket(
             request,
             config.insecure,
-            config.http3,
+            config.http3.get(),
             config.upstream_proxy.as_deref(),
         )
         .await

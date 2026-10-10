@@ -24,7 +24,20 @@ pub async fn run_proxy(settings: Settings, shutdown: impl Future<Output = ()>) -
 pub async fn run_proxy_with_mode_updates(
     settings: Settings,
     shutdown: impl Future<Output = ()>,
+    mode_updates: mpsc::UnboundedReceiver<crate::ProxyMode>,
+) -> Result<()> {
+    let (_http3_updates_tx, http3_updates_rx) = mpsc::unbounded_channel();
+    run_proxy_with_updates(settings, shutdown, mode_updates, http3_updates_rx).await
+}
+
+/// Like [`run_proxy_with_mode_updates`], and the HTTP/3 mode can be changed while the proxy
+/// runs too. An update that the gateway or the upstream proxy rules out is logged and ignored;
+/// check it first with [`http3_unusable_for`].
+pub async fn run_proxy_with_updates(
+    settings: Settings,
+    shutdown: impl Future<Output = ()>,
     mut mode_updates: mpsc::UnboundedReceiver<crate::ProxyMode>,
+    mut http3_updates: mpsc::UnboundedReceiver<Http3Mode>,
 ) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -103,7 +116,7 @@ pub async fn run_proxy_with_mode_updates(
         buffer_size: settings.buffer_size,
         routing_rules,
         insecure: settings.insecure,
-        http3,
+        http3: crate::http3::Switch::new(http3),
         upstream_proxy,
         headers,
     });
@@ -111,6 +124,21 @@ pub async fn run_proxy_with_mode_updates(
     tokio::spawn(async move {
         while let Some(mode) = mode_updates.recv().await {
             dynamic_routing_rules.set_mode(mode);
+        }
+    });
+    let http3_switch = config.http3.clone();
+    let usable = http3_unusable(&config.gateway, config.upstream_proxy.is_some());
+    tokio::spawn(async move {
+        while let Some(mode) = http3_updates.recv().await {
+            match usable {
+                Some(reason) if mode != Http3Mode::Off => {
+                    warn!("HTTP/3 stays off because {reason}");
+                }
+                _ => {
+                    http3_switch.set(mode);
+                    info!(http3 = ?mode, "HTTP/3 mode changed");
+                }
+            }
         }
     });
     let listener = TcpListener::bind(settings.listen)
@@ -137,7 +165,7 @@ pub async fn run_proxy_with_mode_updates(
         socks_listen = %socks_listen_addr.map(|addr| addr.to_string()).unwrap_or_else(|| "disabled".to_owned()),
         gateway = %config.gateway.base(),
         insecure = config.insecure,
-        http3 = ?config.http3,
+        http3 = ?config.http3.get(),
         rule_refresh_interval_secs = settings.rule_refresh_interval.as_secs(),
         routing_rules = %config.routing_rules,
         routing_rules_detail = %config.routing_rules.describe(),
@@ -198,6 +226,26 @@ where
     F: Future<Output = ()>,
 {
     Box::pin(shutdown)
+}
+
+/// The HTTP/3 mode that `settings` start the proxy with.
+pub fn http3_mode(settings: &Settings) -> Http3Mode {
+    if settings.http3_only {
+        Http3Mode::Only
+    } else if settings.http3
+        && http3_unusable_for(&settings.gateway, settings.upstream_proxy.is_some()).is_none()
+    {
+        Http3Mode::Preferred
+    } else {
+        Http3Mode::Off
+    }
+}
+
+/// Why HTTP/3 cannot be used with this gateway URL and upstream proxy setting, if it cannot.
+pub fn http3_unusable_for(gateway: &str, has_upstream_proxy: bool) -> Option<&'static str> {
+    Gateway::parse(gateway)
+        .ok()
+        .and_then(|gateway| http3_unusable(&gateway, has_upstream_proxy))
 }
 
 /// Why `--http3` cannot apply, if it cannot: QUIC needs a `wss` gateway and a direct path to it.

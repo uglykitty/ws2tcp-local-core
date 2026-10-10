@@ -70,13 +70,31 @@ impl Drop for TunnelGuard {
 
 /// How tunnels to the gateway use HTTP/3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Mode {
+pub enum Mode {
     /// TCP only.
     Off,
     /// HTTP/3 first, HTTP/1.1 over TCP when that fails.
     Preferred,
     /// HTTP/3 only: when it fails, the tunnel fails, with no TCP fallback.
     Only,
+}
+
+/// The HTTP/3 mode of the running proxy, which can be changed while it runs.
+#[derive(Debug, Clone)]
+pub(crate) struct Switch(std::sync::Arc<std::sync::Mutex<Mode>>);
+
+impl Switch {
+    pub(crate) fn new(mode: Mode) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(mode)))
+    }
+
+    pub(crate) fn get(&self) -> Mode {
+        *self.0.lock().unwrap()
+    }
+
+    pub(crate) fn set(&self, mode: Mode) {
+        *self.0.lock().unwrap() = mode;
+    }
 }
 
 /// One cached QUIC connection to the gateway, as [`snapshot`] reports it.
