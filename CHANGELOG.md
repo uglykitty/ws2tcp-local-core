@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.0 - 2026-10-10
+
+### Changed
+
+- **`Settings::http3` is an `Http3Mode` (`Off`, `Preferred`, `Only`), and `Settings::http3_only`
+  is gone.** `Preferred` is the former `http3: true`, and `Only` the former `http3_only: true`,
+  so the combination of `http3_only` without `http3` can no longer be built. `Http3Mode` is
+  `Default` (`Off`), and deserializes from `"off"`, `"on"`, `"only"`, and from a boolean.
+- `run_proxy` refuses `Only` with a `ws://` gateway or an upstream proxy with "HTTP/3 only cannot
+  be used: ...".
+
 ## 0.8.0 - 2026-10-10
 
 ### Changed
