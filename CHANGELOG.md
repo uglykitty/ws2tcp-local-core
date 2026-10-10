@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.0 - 2026-10-10
+
+### Added
+
+- **`run_proxy_with_updates`** is `run_proxy_with_mode_updates` with a second channel of
+  `Http3Mode` updates, so the HTTP/3 mode can change while the proxy runs. The new mode applies
+  to tunnels opened afterwards. An update to `Preferred` or `Only` is ignored, with a warning,
+  when the gateway is not a `wss://` URL or an upstream proxy is set.
+- **`Http3Mode`** (`Off`, `Preferred`, `Only`), **`http3_mode(&Settings)`**, which is the mode a
+  proxy starts with, and **`http3_unusable_for(gateway, has_upstream_proxy)`**, which says why
+  HTTP/3 cannot be used.
+
 ## 0.6.0 - 2026-10-10
 
 ### Added
