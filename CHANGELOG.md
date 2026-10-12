@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.10.0 - 2026-10-12
+
+### Changed
+
+- **The gfwlist sources are a setting, `Settings::gfwlist_urls`, tried in order until one
+  works.** It comes from `SettingsOverrides::gfwlist_urls` or `gfwlist_urls` in the config file,
+  and otherwise is `DEFAULT_GFWLIST_URLS`, the former built-in URLs. A given list replaces the
+  default one: the built-in URLs are not tried after it. An empty list, or one of only blank
+  entries, means the default list. Code that builds `Settings` or `SettingsOverrides` field by
+  field has to set the new field.
+- The primary built-in URL is
+  `https://wangguofang.net/raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt`, without
+  `refs/heads`.
+
+### Added
+
+- **`resolve_gfwlist_urls`** trims the entries, fills in `DEFAULT_GFWLIST_URLS` and refuses
+  anything but `http://` and `https://` URLs, for frontends that build `Settings` themselves.
+
 ## 0.9.0 - 2026-10-10
 
 ### Changed
