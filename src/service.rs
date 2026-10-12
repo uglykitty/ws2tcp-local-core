@@ -105,6 +105,7 @@ pub async fn run_proxy_with_updates(
     let routing_rules = RoutingRules::load(
         settings.proxy_mode,
         settings.custom_domain_rules.as_deref(),
+        &settings.gfwlist_urls,
         settings.rule_refresh_interval,
         upstream_proxy.as_deref(),
     )

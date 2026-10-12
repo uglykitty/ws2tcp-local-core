@@ -20,9 +20,6 @@ use tracing::{info, warn};
 
 use crate::{settings::ProxyMode, upstream::UpstreamProxy};
 
-const PRIMARY_GFWLIST_URL: &str = "https://wangguofang.net/raw.githubusercontent.com/gfwlist/gfwlist/refs/heads/master/gfwlist.txt";
-const FALLBACK_GFWLIST_URL: &str = "https://gitlab.com/gfwlist/gfwlist/raw/master/gfwlist.txt";
-const GFWLIST_URLS: &[&str] = &[PRIMARY_GFWLIST_URL, FALLBACK_GFWLIST_URL];
 const CACHE_DIR_NAME: &str = "ws2tcp-local";
 const GFWLIST_CACHE_FILE: &str = "gfwlist.txt";
 
@@ -49,8 +46,18 @@ pub(crate) struct RoutingRules {
     state: Arc<RwLock<RoutingRulesState>>,
     generation: Arc<AtomicU64>,
     custom_domain_rules: Option<PathBuf>,
+    gfwlist_urls: Arc<[String]>,
     refresh_interval: Duration,
     client: Client,
+}
+
+/// The gfwlist sources for messages: the first one, then the others as fallbacks.
+fn describe_gfwlist_urls(urls: &[String]) -> String {
+    match urls {
+        [] => "no gfwlist sources".to_owned(),
+        [only] => only.clone(),
+        [first, rest @ ..] => format!("{first} (fallback {})", rest.join(", ")),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +65,7 @@ enum RoutingRulesState {
     Domains {
         rules: DomainRules,
         custom_domain_rules: Option<PathBuf>,
-        source: &'static str,
+        source: String,
     },
     GlobalProxy,
     DirectFallback,
@@ -68,29 +75,34 @@ impl RoutingRules {
     pub(crate) async fn load(
         proxy_mode: ProxyMode,
         custom_domain_rules: Option<&Path>,
+        gfwlist_urls: &[String],
         refresh_interval: Duration,
         upstream_proxy: Option<&UpstreamProxy>,
     ) -> Result<Self> {
         let client = build_http_client(upstream_proxy)?;
+        let gfwlist_urls: Arc<[String]> = gfwlist_urls.into();
 
         if proxy_mode == ProxyMode::Global {
             info!("using global proxy mode; skipping proxy routing rule download");
             return Ok(Self::new(
                 RoutingRulesState::GlobalProxy,
                 custom_domain_rules.map(Path::to_path_buf),
+                gfwlist_urls,
                 refresh_interval,
                 client,
             ));
         }
 
-        let mut loader =
-            AutoRuleLoader::new(custom_domain_rules.map(Path::to_path_buf), client.clone());
+        let mut loader = AutoRuleLoader::new(
+            custom_domain_rules.map(Path::to_path_buf),
+            Arc::clone(&gfwlist_urls),
+            client.clone(),
+        );
         let state = match loader.load_state().await {
             Ok(state) => state,
             Err(err) => {
                 warn!(
-                    primary_url = PRIMARY_GFWLIST_URL,
-                    fallback_url = FALLBACK_GFWLIST_URL,
+                    gfwlist_urls = %describe_gfwlist_urls(&gfwlist_urls),
                     custom_domain_rules = custom_domain_rules.map(|path| path.display().to_string()),
                     error = %format_args!("{err:#}"),
                     "failed to load proxy routing rules; direct routing until rules are available"
@@ -101,6 +113,7 @@ impl RoutingRules {
         let rules = Self::new(
             state,
             custom_domain_rules.map(Path::to_path_buf),
+            gfwlist_urls,
             refresh_interval,
             client,
         );
@@ -111,6 +124,7 @@ impl RoutingRules {
     fn new(
         state: RoutingRulesState,
         custom_domain_rules: Option<PathBuf>,
+        gfwlist_urls: Arc<[String]>,
         refresh_interval: Duration,
         client: Client,
     ) -> Self {
@@ -118,6 +132,7 @@ impl RoutingRules {
             state: Arc::new(RwLock::new(state)),
             generation: Arc::new(AtomicU64::new(0)),
             custom_domain_rules,
+            gfwlist_urls,
             refresh_interval,
             client,
         }
@@ -149,8 +164,7 @@ impl RoutingRules {
                     }
                     Err(err) => {
                         warn!(
-                            primary_url = PRIMARY_GFWLIST_URL,
-                            fallback_url = FALLBACK_GFWLIST_URL,
+                            gfwlist_urls = %describe_gfwlist_urls(&loader.gfwlist_urls),
                             custom_domain_rules =
                                 loader.custom_domain_rules_display(),
                             error = %format_args!("{err:#}"),
@@ -175,6 +189,7 @@ impl RoutingRules {
                 tokio::spawn(async move {
                     let mut loader = AutoRuleLoader::new(
                         rules.custom_domain_rules.clone(),
+                        Arc::clone(&rules.gfwlist_urls),
                         rules.client.clone(),
                     );
                     match loader.load_state().await {
@@ -218,7 +233,7 @@ impl RoutingRules {
         self.state
             .read()
             .expect("routing rules lock poisoned")
-            .describe()
+            .describe(&self.gfwlist_urls)
     }
 }
 
@@ -226,6 +241,7 @@ impl RoutingRules {
 struct AutoRuleLoader {
     custom_domain_rules: Option<PathBuf>,
     custom_cache: Option<CustomDomainRulesCache>,
+    gfwlist_urls: Arc<[String]>,
     gfwlist_cache: GfwlistCache,
     client: Client,
 }
@@ -246,10 +262,15 @@ enum GfwlistCache {
 }
 
 impl AutoRuleLoader {
-    fn new(custom_domain_rules: Option<PathBuf>, client: Client) -> Self {
+    fn new(
+        custom_domain_rules: Option<PathBuf>,
+        gfwlist_urls: Arc<[String]>,
+        client: Client,
+    ) -> Self {
         Self {
             custom_domain_rules,
             custom_cache: None,
+            gfwlist_urls,
             gfwlist_cache: GfwlistCache::new(),
             client,
         }
@@ -264,8 +285,11 @@ impl AutoRuleLoader {
         ))
     }
 
-    async fn download_and_parse(&mut self) -> Result<(DomainRules, &'static str)> {
-        let (body, source) = self.gfwlist_cache.load_gfwlist_body(&self.client).await?;
+    async fn download_and_parse(&mut self) -> Result<(DomainRules, String)> {
+        let (body, source) = self
+            .gfwlist_cache
+            .load_gfwlist_body(&self.client, &self.gfwlist_urls)
+            .await?;
 
         let mut rules = parse_gfwlist(&body)?;
         if let Some(custom_domains) = self.load_custom_domain_rules()? {
@@ -322,10 +346,10 @@ impl RoutingRulesState {
     fn from_domain_rules(
         rules: DomainRules,
         custom_domain_rules: Option<&Path>,
-        source: &'static str,
+        source: String,
     ) -> Self {
         info!(
-            url = source,
+            url = %source,
             custom_domain_rules = custom_domain_rules.map(|path| path.display().to_string()),
             domain_count = rules.len(),
             "loaded proxy routing rules"
@@ -352,7 +376,7 @@ impl RoutingRulesState {
         }
     }
 
-    fn describe(&self) -> String {
+    fn describe(&self, gfwlist_urls: &[String]) -> String {
         match self {
             Self::Domains {
                 rules,
@@ -372,7 +396,8 @@ impl RoutingRulesState {
             Self::GlobalProxy => "all domains via proxy; proxy mode is global".to_owned(),
             Self::DirectFallback => {
                 format!(
-                    "direct routing; failed to load {PRIMARY_GFWLIST_URL} (fallback {FALLBACK_GFWLIST_URL})"
+                    "direct routing; failed to load {}",
+                    describe_gfwlist_urls(gfwlist_urls)
                 )
             }
         }
@@ -427,8 +452,12 @@ impl GfwlistCache {
         };
     }
 
-    async fn load_gfwlist_body(&mut self, client: &Client) -> Result<(Vec<u8>, &'static str)> {
-        let (remote_modified, head_source) = fetch_remote_last_modified(client).await?;
+    async fn load_gfwlist_body(
+        &mut self,
+        client: &Client,
+        urls: &[String],
+    ) -> Result<(Vec<u8>, String)> {
+        let (remote_modified, head_source) = fetch_remote_last_modified(client, urls).await?;
 
         if let Self::Disk(cache_path) = self {
             let cached = match remote_modified {
@@ -447,7 +476,7 @@ impl GfwlistCache {
                     Ok(body) => {
                         info!(
                             cache_path = %cache_path.display(),
-                            url = head_source,
+                            url = %head_source,
                             "using cached gfwlist"
                         );
                         return Ok((body, head_source));
@@ -458,11 +487,11 @@ impl GfwlistCache {
         }
 
         if let Some(body) = self.memory_body_if_current(remote_modified) {
-            info!(url = head_source, "using in-memory cached gfwlist");
+            info!(url = %head_source, "using in-memory cached gfwlist");
             return Ok((body, head_source));
         }
 
-        let (body, downloaded_modified, get_source) = download_gfwlist_body(client).await?;
+        let (body, downloaded_modified, get_source) = download_gfwlist_body(client, urls).await?;
         // Only reuse the HEAD timestamp when the GET hit the same source;
         // timestamps across mirrors are not comparable.
         let effective_modified = downloaded_modified.or(if get_source == head_source {
@@ -472,7 +501,8 @@ impl GfwlistCache {
         });
 
         if let Self::Disk(cache_path) = self
-            && let Err(err) = write_gfwlist_cache(cache_path, &body, effective_modified, get_source)
+            && let Err(err) =
+                write_gfwlist_cache(cache_path, &body, effective_modified, &get_source)
         {
             self.switch_to_memory(&err);
         }
@@ -484,14 +514,17 @@ impl GfwlistCache {
     }
 }
 
-async fn fetch_remote_last_modified(client: &Client) -> Result<(Option<SystemTime>, &'static str)> {
+async fn fetch_remote_last_modified(
+    client: &Client,
+    urls: &[String],
+) -> Result<(Option<SystemTime>, String)> {
     let mut last_err: Option<anyhow::Error> = None;
-    for &url in GFWLIST_URLS {
+    for url in urls {
         match fetch_remote_last_modified_from(client, url).await {
-            Ok(modified) => return Ok((modified, url)),
+            Ok(modified) => return Ok((modified, url.clone())),
             Err(err) => {
                 warn!(
-                    url = url,
+                    url = %url,
                     error = %format_args!("{err:#}"),
                     "failed to check remote gfwlist timestamp; trying next source"
                 );
@@ -502,15 +535,13 @@ async fn fetch_remote_last_modified(client: &Client) -> Result<(Option<SystemTim
 
     Err(last_err.unwrap_or_else(|| anyhow!("no gfwlist sources configured"))).with_context(|| {
         format!(
-            "failed to check remote gfwlist timestamp {PRIMARY_GFWLIST_URL} (fallback {FALLBACK_GFWLIST_URL})"
+            "failed to check remote gfwlist timestamp {}",
+            describe_gfwlist_urls(urls)
         )
     })
 }
 
-async fn fetch_remote_last_modified_from(
-    client: &Client,
-    url: &'static str,
-) -> Result<Option<SystemTime>> {
+async fn fetch_remote_last_modified_from(client: &Client, url: &str) -> Result<Option<SystemTime>> {
     let response = client
         .head(url)
         .send()
@@ -524,9 +555,10 @@ async fn fetch_remote_last_modified_from(
 
 async fn download_gfwlist_body(
     client: &Client,
-) -> Result<(Vec<u8>, Option<SystemTime>, &'static str)> {
+    urls: &[String],
+) -> Result<(Vec<u8>, Option<SystemTime>, String)> {
     let mut last_err: Option<anyhow::Error> = None;
-    for &url in GFWLIST_URLS {
+    for (index, url) in urls.iter().enumerate() {
         match client.get(url).send().await {
             Ok(response) => match response.error_for_status() {
                 Ok(response) => {
@@ -536,15 +568,15 @@ async fn download_gfwlist_body(
                         .await
                         .context("failed to read gfwlist response body")?
                         .to_vec();
-                    if url != PRIMARY_GFWLIST_URL {
-                        info!(url = url, "downloaded gfwlist from fallback source");
+                    if index > 0 {
+                        info!(url = %url, "downloaded gfwlist from fallback source");
                     }
-                    return Ok((body, downloaded_modified, url));
+                    return Ok((body, downloaded_modified, url.clone()));
                 }
                 Err(err) => {
                     let err = anyhow!(err).context(format!("failed to download {url}"));
                     warn!(
-                        url = url,
+                        url = %url,
                         error = %format_args!("{err:#}"),
                         "failed to download gfwlist; trying next source"
                     );
@@ -554,7 +586,7 @@ async fn download_gfwlist_body(
             Err(err) => {
                 let err = anyhow!(err).context(format!("failed to download {url}"));
                 warn!(
-                    url = url,
+                    url = %url,
                     error = %format_args!("{err:#}"),
                     "failed to download gfwlist; trying next source"
                 );
@@ -563,9 +595,8 @@ async fn download_gfwlist_body(
         }
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow!("no gfwlist sources configured"))).with_context(|| {
-        format!("failed to download {PRIMARY_GFWLIST_URL} (fallback {FALLBACK_GFWLIST_URL})")
-    })
+    Err(last_err.unwrap_or_else(|| anyhow!("no gfwlist sources configured")))
+        .with_context(|| format!("failed to download {}", describe_gfwlist_urls(urls)))
 }
 
 fn parse_last_modified(headers: &HeaderMap) -> Option<SystemTime> {
@@ -692,7 +723,7 @@ fn write_gfwlist_cache(
     cache_path: &Path,
     body: &[u8],
     remote_modified: Option<SystemTime>,
-    source: &'static str,
+    source: &str,
 ) -> Result<()> {
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
@@ -721,7 +752,7 @@ fn write_gfwlist_cache(
 
     info!(
         cache_path = %cache_path.display(),
-        url = source,
+        url = %source,
         "updated gfwlist cache"
     );
     Ok(())
@@ -880,6 +911,7 @@ impl std::fmt::Display for RoutingRules {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::DEFAULT_GFWLIST_URLS;
     use base64::engine::general_purpose::STANDARD;
 
     #[test]
@@ -943,7 +975,8 @@ bad:domain
         let path = temp_custom_rules_path("custom-cache-reuses-unchanged");
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         write_custom_rules_at(&path, ".first.example\n", modified);
-        let mut loader = AutoRuleLoader::new(Some(path.clone()), Client::new());
+        let mut loader =
+            AutoRuleLoader::new(Some(path.clone()), default_gfwlist_urls(), Client::new());
 
         let first = loader.load_custom_domain_rules().unwrap().unwrap();
         write_custom_rules_at(&path, ".second.example\n", modified);
@@ -961,7 +994,8 @@ bad:domain
         let first_modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let second_modified = first_modified + Duration::from_secs(2);
         write_custom_rules_at(&path, ".first.example\n", first_modified);
-        let mut loader = AutoRuleLoader::new(Some(path.clone()), Client::new());
+        let mut loader =
+            AutoRuleLoader::new(Some(path.clone()), default_gfwlist_urls(), Client::new());
 
         let first = loader.load_custom_domain_rules().unwrap().unwrap();
         write_custom_rules_at(&path, ".second.example\n", second_modified);
@@ -1018,6 +1052,7 @@ bad:domain
         let rules = RoutingRules::new(
             RoutingRulesState::GlobalProxy,
             None,
+            default_gfwlist_urls(),
             Duration::from_secs(60),
             Client::new(),
         );
@@ -1035,6 +1070,7 @@ bad:domain
         let rules = RoutingRules::load(
             ProxyMode::Global,
             Some(Path::new("/definitely/missing/custom-domains.txt")),
+            &default_gfwlist_urls(),
             Duration::from_secs(60),
             None,
         )
@@ -1069,6 +1105,7 @@ bad:domain
         let rules = RoutingRules::new(
             RoutingRulesState::DirectFallback,
             None,
+            default_gfwlist_urls(),
             Duration::from_secs(60),
             Client::new(),
         );
@@ -1078,7 +1115,8 @@ bad:domain
         assert_eq!(
             rules.describe(),
             format!(
-                "direct routing; failed to load {PRIMARY_GFWLIST_URL} (fallback {FALLBACK_GFWLIST_URL})"
+                "direct routing; failed to load {} (fallback {})",
+                DEFAULT_GFWLIST_URLS[0], DEFAULT_GFWLIST_URLS[1]
             )
         );
     }
@@ -1088,6 +1126,7 @@ bad:domain
         let rules = RoutingRules::new(
             RoutingRulesState::DirectFallback,
             None,
+            default_gfwlist_urls(),
             Duration::from_secs(60),
             Client::new(),
         );
@@ -1096,6 +1135,21 @@ bad:domain
 
         assert!(rules.should_proxy_host("example.com"));
         assert_eq!(rules.to_string(), "global");
+    }
+
+    #[test]
+    fn describes_gfwlist_sources_with_fallbacks() {
+        let urls = |urls: &[&str]| urls.iter().map(|&url| url.to_owned()).collect::<Vec<_>>();
+
+        assert_eq!(describe_gfwlist_urls(&urls(&["https://a/"])), "https://a/");
+        assert_eq!(
+            describe_gfwlist_urls(&urls(&["https://a/", "https://b/", "https://c/"])),
+            "https://a/ (fallback https://b/, https://c/)"
+        );
+    }
+
+    fn default_gfwlist_urls() -> Arc<[String]> {
+        crate::settings::resolve_gfwlist_urls(None).unwrap().into()
     }
 
     fn temp_custom_rules_path(name: &str) -> PathBuf {

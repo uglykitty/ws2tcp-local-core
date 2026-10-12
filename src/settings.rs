@@ -8,12 +8,18 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+use url::Url;
 
 use crate::{http3::Mode as Http3Mode, upstream::UpstreamProxy};
 
 pub const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:3128";
 pub const DEFAULT_RULE_REFRESH_INTERVAL_SECS: u64 = 60;
+/// Where the gfwlist is downloaded from when no list is configured, tried in order.
+pub const DEFAULT_GFWLIST_URLS: &[&str] = &[
+    "https://wangguofang.net/raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt",
+    "https://gitlab.com/gfwlist/gfwlist/raw/master/gfwlist.txt",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -50,6 +56,10 @@ pub struct Settings {
     pub log_level: Option<String>,
     pub custom_domain_rules: Option<PathBuf>,
     pub rule_refresh_interval: Duration,
+    /// Where the gfwlist is downloaded from in auto proxy mode, tried in order until one works.
+    /// Never empty; [`resolve_gfwlist_urls`] fills in [`DEFAULT_GFWLIST_URLS`]. A configured list
+    /// replaces the default one: the default sources are not tried after it.
+    pub gfwlist_urls: Vec<String>,
     pub proxy_mode: ProxyMode,
     pub insecure: bool,
     /// How gateway tunnels use HTTP/3 (WebSocket over QUIC, RFC 9220). `Preferred` falls back to
@@ -102,6 +112,7 @@ struct FileSettings {
     log_level: Option<String>,
     custom_domain_rules: Option<PathBuf>,
     rule_refresh_interval_secs: Option<u64>,
+    gfwlist_urls: Option<Vec<String>>,
     proxy_mode: Option<ProxyMode>,
     insecure: Option<bool>,
     http3: Option<Http3Mode>,
@@ -122,6 +133,9 @@ pub struct SettingsOverrides {
     pub log_level: Option<String>,
     pub custom_domain_rules: Option<PathBuf>,
     pub rule_refresh_interval_secs: Option<u64>,
+    /// Overrides `gfwlist_urls` from the file. An empty list (or one of only blank entries) means
+    /// the default list, and overrides one from the file.
+    pub gfwlist_urls: Option<Vec<String>>,
     pub proxy_mode: Option<ProxyMode>,
     pub insecure: bool,
     /// Overrides `http3` from the file, whatever it says.
@@ -182,6 +196,9 @@ impl Settings {
                     .map(|path| resolve_config_relative_path(path, config_dir.as_deref()))
             }),
             rule_refresh_interval: Duration::from_secs(rule_refresh_interval_secs),
+            gfwlist_urls: resolve_gfwlist_urls(
+                overrides.gfwlist_urls.or(file_settings.gfwlist_urls),
+            )?,
             proxy_mode: overrides
                 .proxy_mode
                 .or(file_settings.proxy_mode)
@@ -205,6 +222,31 @@ impl Settings {
             headers: Vec::new(),
         })
     }
+}
+
+/// The gfwlist sources to use: the given ones, trimmed and with blank entries dropped, or
+/// [`DEFAULT_GFWLIST_URLS`] when that leaves none. Each must be an `http://` or `https://` URL.
+pub fn resolve_gfwlist_urls(urls: Option<Vec<String>>) -> Result<Vec<String>> {
+    let urls: Vec<String> = urls
+        .unwrap_or_default()
+        .into_iter()
+        .map(|url| url.trim().to_owned())
+        .filter(|url| !url.is_empty())
+        .collect();
+    if urls.is_empty() {
+        return Ok(DEFAULT_GFWLIST_URLS
+            .iter()
+            .map(|&url| url.to_owned())
+            .collect());
+    }
+
+    for url in &urls {
+        let parsed = Url::parse(url).with_context(|| format!("invalid gfwlist URL {url:?}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            bail!("invalid gfwlist URL {url:?}: must be an http:// or https:// URL");
+        }
+    }
+    Ok(urls)
 }
 
 fn resolve_config_relative_path(path: PathBuf, config_dir: Option<&Path>) -> PathBuf {
@@ -240,6 +282,7 @@ mod tests {
             log_level: None,
             custom_domain_rules: None,
             rule_refresh_interval_secs: None,
+            gfwlist_urls: None,
             proxy_mode: None,
             insecure: false,
             http3: None,
@@ -258,6 +301,7 @@ mod tests {
             log_level: None,
             custom_domain_rules: None,
             rule_refresh_interval: Duration::from_secs(DEFAULT_RULE_REFRESH_INTERVAL_SECS),
+            gfwlist_urls: resolve_gfwlist_urls(None).unwrap(),
             proxy_mode: ProxyMode::Global,
             insecure: false,
             http3: Http3Mode::Off,
@@ -308,6 +352,7 @@ mod tests {
             log_level: Some("debug".to_owned()),
             custom_domain_rules: Some("cli-domains.txt".into()),
             rule_refresh_interval_secs: Some(30),
+            gfwlist_urls: None,
             proxy_mode: Some(ProxyMode::Global),
             insecure: true,
             http3: None,
@@ -363,6 +408,7 @@ insecure = true
             log_level: Some("debug".to_owned()),
             custom_domain_rules: Some("cli-domains.txt".into()),
             rule_refresh_interval_secs: Some(30),
+            gfwlist_urls: None,
             proxy_mode: Some(ProxyMode::Global),
             insecure: false,
             http3: None,
@@ -439,6 +485,7 @@ http3 = true
             log_level: None,
             custom_domain_rules: None,
             rule_refresh_interval_secs: None,
+            gfwlist_urls: None,
             proxy_mode: None,
             insecure: false,
             http3: None,
@@ -462,6 +509,7 @@ http3 = true
             log_level: None,
             custom_domain_rules: None,
             rule_refresh_interval_secs: None,
+            gfwlist_urls: None,
             proxy_mode: None,
             insecure: false,
             http3: None,
@@ -485,6 +533,7 @@ http3 = true
             log_level: None,
             custom_domain_rules: None,
             rule_refresh_interval_secs: None,
+            gfwlist_urls: None,
             proxy_mode: None,
             insecure: false,
             http3: None,
@@ -508,6 +557,7 @@ http3 = true
             log_level: None,
             custom_domain_rules: None,
             rule_refresh_interval_secs: None,
+            gfwlist_urls: None,
             proxy_mode: None,
             insecure: false,
             http3: None,
@@ -535,6 +585,7 @@ http3 = true
                 log_level: None,
                 custom_domain_rules: None,
                 rule_refresh_interval_secs: Some(0),
+                gfwlist_urls: None,
                 proxy_mode: None,
                 insecure: false,
                 http3: None,
@@ -543,6 +594,67 @@ http3 = true
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn gfwlist_urls_default_and_can_come_from_the_file_or_the_flag() {
+        let default_urls: Vec<String> = DEFAULT_GFWLIST_URLS
+            .iter()
+            .map(|&url| url.to_owned())
+            .collect();
+        let resolve = |config: Option<PathBuf>, urls: Option<Vec<&str>>| {
+            Settings::resolve(SettingsOverrides {
+                gateway: Some("wss://example.com/ws".to_owned()),
+                gfwlist_urls: urls.map(|urls| urls.into_iter().map(str::to_owned).collect()),
+                ..overrides_with_config(config)
+            })
+            .map(|settings| settings.gfwlist_urls)
+        };
+
+        assert_eq!(resolve(None, None).unwrap(), default_urls);
+
+        let config_path = std::env::temp_dir().join(format!(
+            "ws2tcp-local-test-{}-{}.toml",
+            std::process::id(),
+            "gfwlist-urls"
+        ));
+        fs::write(
+            &config_path,
+            r#"gfwlist_urls = ["https://file.example/gfwlist.txt", " http://mirror.example/g "]"#,
+        )
+        .unwrap();
+        let from_file = resolve(Some(config_path.clone()), None);
+        let from_flag = resolve(
+            Some(config_path.clone()),
+            Some(vec!["https://cli.example/gfwlist.txt"]),
+        );
+        let blank_flag = resolve(Some(config_path.clone()), Some(vec!["", "  "]));
+        let _ = fs::remove_file(&config_path);
+
+        assert_eq!(
+            from_file.unwrap(),
+            [
+                "https://file.example/gfwlist.txt",
+                "http://mirror.example/g"
+            ]
+        );
+        assert_eq!(from_flag.unwrap(), ["https://cli.example/gfwlist.txt"]);
+        assert_eq!(blank_flag.unwrap(), default_urls);
+    }
+
+    #[test]
+    fn rejects_gfwlist_urls_that_are_not_http() {
+        for url in [
+            "ftp://example.com/gfwlist.txt",
+            "example.com/gfwlist.txt",
+            "file:///gfwlist.txt",
+        ] {
+            let err = resolve_gfwlist_urls(Some(vec![url.to_owned()])).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("invalid gfwlist URL"),
+                "{err:#}"
+            );
+        }
     }
 
     #[test]
