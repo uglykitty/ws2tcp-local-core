@@ -14,6 +14,7 @@ use crate::{http3::Mode as Http3Mode, upstream::UpstreamProxy};
 
 pub const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:3128";
+pub const DEFAULT_GATEWAY: &str = "wss://wangguofang.net/tunnel";
 pub const DEFAULT_RULE_REFRESH_INTERVAL_SECS: u64 = 60;
 /// Where the gfwlist is downloaded from when no list is configured, tried in order.
 pub const DEFAULT_GFWLIST_URLS: &[&str] = &[
@@ -163,7 +164,7 @@ impl Settings {
         let gateway = overrides
             .gateway
             .or(file_settings.gateway)
-            .ok_or_else(|| anyhow!("--gateway is required unless provided by --config"))?;
+            .unwrap_or_else(|| DEFAULT_GATEWAY.to_owned());
         let buffer_size = overrides
             .buffer_size
             .or(file_settings.buffer_size)
@@ -336,8 +337,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_gateway() {
-        assert!(Settings::resolve(overrides_with_config(None)).is_err());
+    fn defaults_missing_gateway() {
+        let settings = Settings::resolve(overrides_with_config(None)).unwrap();
+        assert_eq!(settings.gateway, DEFAULT_GATEWAY);
     }
 
     #[test]

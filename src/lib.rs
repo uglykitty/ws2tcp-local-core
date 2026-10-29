@@ -20,7 +20,7 @@ pub use service::{
     http3_mode, http3_unusable_for, run_proxy, run_proxy_with_mode_updates, run_proxy_with_updates,
 };
 pub use settings::{
-    AuthMode, DEFAULT_BUFFER_SIZE, DEFAULT_GFWLIST_URLS, DEFAULT_LISTEN,
+    AuthMode, DEFAULT_BUFFER_SIZE, DEFAULT_GATEWAY, DEFAULT_GFWLIST_URLS, DEFAULT_LISTEN,
     DEFAULT_RULE_REFRESH_INTERVAL_SECS, ProxyMode, Settings, SettingsOverrides,
     resolve_gfwlist_urls,
 };
