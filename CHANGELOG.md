@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.0 - 2026-10-29
+
+### Changed
+
+- **The gateway has a default, `DEFAULT_GATEWAY` (`wss://wangguofang.net/tunnel`).**
+  `Settings::resolve` uses it when neither `SettingsOverrides::gateway` nor `gateway` in the
+  config file is set, instead of failing with "--gateway is required".
+
 ## 0.10.0 - 2026-10-12
 
 ### Changed
